@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -36,14 +36,47 @@ func parsePeers(peersStr string) (map[int]string, error) {
 	return peers, nil
 }
 
+func parseLogLevel(levelStr string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(levelStr)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func setupLogger(levelStr, formatStr string) {
+	level := parseLogLevel(levelStr)
+	var handler slog.Handler
+
+	opts := &slog.HandlerOptions{Level: level}
+	if strings.ToLower(strings.TrimSpace(formatStr)) == "json" {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+}
+
 func main() {
 	nodeID := flag.Int("id", 1, "Unique Node ID (e.g. 1, 2, 3)")
 	addr := flag.String("addr", "127.0.0.1:8001", "Internal Raft peer address to listen on (host:port)")
 	clientAddr := flag.String("client-addr", "127.0.0.1:9001", "Outside client port/address (reserved for KV client traffic)")
 	peersStr := flag.String("peers", "", "Comma-separated peer mappings (e.g. '2=127.0.0.1:8002,3=127.0.0.1:8003')")
 	dataDir := flag.String("data-dir", "", "Persistent storage directory for Raft log and hard state")
+	logLevel := flag.String("log-level", "info", "Logging level: debug, info, warn, error")
+	logFormat := flag.String("log-format", "text", "Logging format: text, json")
 
 	flag.Parse()
+
+	// 1. Initialize structured logger
+	setupLogger(*logLevel, *logFormat)
 
 	if *dataDir == "" {
 		*dataDir = fmt.Sprintf("data/node%d", *nodeID)
@@ -51,25 +84,29 @@ func main() {
 
 	peers, err := parsePeers(*peersStr)
 	if err != nil {
-		log.Fatalf("Error parsing peers: %v", err)
+		slog.Error("error parsing peers", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("==================================================")
-	log.Printf("Starting Kairo Raft Node %d (etcd/raft Architecture)", *nodeID)
-	log.Printf("Internal Raft Address: %s", *addr)
-	log.Printf("Outside Client Address: %s", *clientAddr)
-	log.Printf("Storage Directory:     %s", *dataDir)
-	log.Printf("Peers:                 %+v", peers)
-	log.Printf("==================================================")
+	slog.Info("starting Kairo Raft Node",
+		slog.Int("node_id", *nodeID),
+		slog.String("internal_addr", *addr),
+		slog.String("client_addr", *clientAddr),
+		slog.String("data_dir", *dataDir),
+		slog.Any("peers", peers),
+		slog.String("log_level", *logLevel),
+		slog.String("log_format", *logFormat),
+	)
 
-	// 1. Initialize persistent stable storage
+	// 2. Initialize persistent stable storage
 	store, err := storage.OpenFileStorage(*dataDir)
 	if err != nil {
-		log.Fatalf("Failed to open stable storage in %s: %v", *dataDir, err)
+		slog.Error("failed to open stable storage", "dir", *dataDir, "error", err)
+		os.Exit(1)
 	}
 	defer store.Close()
 
-	// 2. Initialize RaftServer (coordinates I/O around pure Raft FSM via Ready batches)
+	// 3. Initialize RaftServer (coordinates I/O around pure Raft FSM via Ready batches)
 	serverCfg := raft.ServerConfig{
 		ID:      *nodeID,
 		Addr:    *addr,
@@ -79,22 +116,24 @@ func main() {
 
 	rServer, err := raft.NewRaftServer(serverCfg)
 	if err != nil {
-		log.Fatalf("Failed to create Raft server: %v", err)
+		slog.Error("failed to create Raft server", "error", err)
+		os.Exit(1)
 	}
 	defer rServer.Stop()
 
-	// 3. Start internal RPC server
+	// 4. Start internal RPC server
 	srv, err := transport.NewServer(*addr, rServer)
 	if err != nil {
-		log.Fatalf("Failed to start transport server on %s: %v", *addr, err)
+		slog.Error("failed to start transport server", "addr", *addr, "error", err)
+		os.Exit(1)
 	}
 	defer srv.Close()
 
-	log.Printf("[Node %d] Raft node initialized and running. Waiting for signals...", *nodeID)
+	slog.Info("node initialized and running", "node_id", *nodeID)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 
-	log.Printf("[Node %d] Shutting down gracefully...", *nodeID)
+	slog.Info("shutting down gracefully", "node_id", *nodeID)
 }

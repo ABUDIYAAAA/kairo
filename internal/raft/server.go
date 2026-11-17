@@ -2,7 +2,7 @@ package raft
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -36,6 +36,10 @@ type RaftServer struct {
 	mu           sync.Mutex
 	pendingVotes map[int]chan transport.RequestVoteReply
 	pendingApps  map[int]chan transport.AppendEntriesReply
+
+	// Throttle logging for periodic heartbeats
+	lastHeartbeatLog time.Time
+	lastLeaderId     int
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -96,7 +100,6 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 func (s *RaftServer) run() {
 	defer s.wg.Done()
 
-	// Ticker driving the logical Raft clock (100ms per tick)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -109,16 +112,50 @@ func (s *RaftServer) run() {
 			s.node.Tick()
 
 		case rd := <-s.node.Ready():
-			// 1. Persist HardState and Entries synchronously before sending messages (Raft §Figure 2)
+			// Structured logging for role changes and elections
+			if rd.SoftState != nil {
+				switch rd.SoftState.Role {
+				case state.Leader:
+					slog.Info("won election",
+						slog.Int("node_id", s.id),
+						slog.String("role", string(state.Leader)),
+						slog.Uint64("term", s.node.Term()),
+					)
+				case state.Candidate:
+					slog.Info("started election",
+						slog.Int("node_id", s.id),
+						slog.String("role", string(state.Candidate)),
+						slog.Uint64("term", s.node.Term()),
+					)
+				case state.Follower:
+					if rd.SoftState.Lead != s.lastLeaderId && rd.SoftState.Lead != storage.NoVote {
+						slog.Info("recognized leader",
+							slog.Int("node_id", s.id),
+							slog.String("role", string(state.Follower)),
+							slog.Int("leader_id", rd.SoftState.Lead),
+							slog.Uint64("term", s.node.Term()),
+						)
+						s.lastLeaderId = rd.SoftState.Lead
+					}
+				}
+			}
+
+			// 1. Persist HardState and Entries synchronously before sending messages (Raft Figure 2)
 			if rd.HardState != nil {
 				if err := s.storage.SaveState(rd.HardState.CurrentTerm, rd.HardState.VotedFor); err != nil {
-					log.Printf("[Node %d] ERROR: failed to save HardState: %v", s.id, err)
+					slog.Error("failed to save HardState",
+						slog.Int("node_id", s.id),
+						slog.Any("error", err),
+					)
 				}
 			}
 
 			if len(rd.Entries) > 0 {
 				if err := s.storage.Append(rd.Entries...); err != nil {
-					log.Printf("[Node %d] ERROR: failed to append log entries: %v", s.id, err)
+					slog.Error("failed to append log entries",
+						slog.Int("node_id", s.id),
+						slog.Any("error", err),
+					)
 				}
 			}
 
@@ -173,6 +210,20 @@ func (s *RaftServer) handleOutboundMessage(msg Message) {
 			}
 			var reply transport.RequestVoteReply
 			if err := s.transport.RequestVote(addr, &args, &reply); err == nil {
+				if reply.VoteGranted {
+					slog.Info("received vote",
+						slog.Int("node_id", s.id),
+						slog.Int("from_peer", m.To),
+						slog.Uint64("term", reply.Term),
+					)
+				} else {
+					slog.Debug("peer rejected vote",
+						slog.Int("node_id", s.id),
+						slog.Int("from_peer", m.To),
+						slog.Uint64("term", m.Term),
+						slog.Uint64("peer_term", reply.Term),
+					)
+				}
 				_ = s.node.Step(Message{
 					Type:   MsgVoteResp,
 					From:   m.To,
@@ -233,12 +284,28 @@ func (s *RaftServer) RequestVote(args *transport.RequestVoteArgs, reply *transpo
 	select {
 	case res := <-ch:
 		*reply = res
+		if res.VoteGranted {
+			slog.Info("granted vote",
+				slog.Int("node_id", s.id),
+				slog.Int("candidate", args.CandidateId),
+				slog.Uint64("term", args.Term),
+			)
+		} else {
+			slog.Debug("denied vote",
+				slog.Int("node_id", s.id),
+				slog.Int("candidate", args.CandidateId),
+				slog.Uint64("candidate_term", args.Term),
+				slog.Uint64("current_term", s.Term()),
+			)
+		}
 		return nil
+
 	case <-time.After(200 * time.Millisecond):
 		s.mu.Lock()
 		delete(s.pendingVotes, args.CandidateId)
 		s.mu.Unlock()
 		return fmt.Errorf("timeout waiting for vote processing")
+
 	case <-s.stopCh:
 		return ErrStopped
 	}
@@ -273,12 +340,31 @@ func (s *RaftServer) AppendEntries(args *transport.AppendEntriesArgs, reply *tra
 	select {
 	case res := <-ch:
 		*reply = res
+		s.mu.Lock()
+		if time.Since(s.lastHeartbeatLog) >= 2*time.Second || s.lastLeaderId != args.LeaderId {
+			slog.Info("received heartbeat",
+				slog.Int("node_id", s.id),
+				slog.Int("leader_id", args.LeaderId),
+				slog.Uint64("term", args.Term),
+			)
+			s.lastHeartbeatLog = time.Now()
+			s.lastLeaderId = args.LeaderId
+		} else {
+			slog.Debug("received heartbeat",
+				slog.Int("node_id", s.id),
+				slog.Int("leader_id", args.LeaderId),
+				slog.Uint64("term", args.Term),
+			)
+		}
+		s.mu.Unlock()
 		return nil
+
 	case <-time.After(200 * time.Millisecond):
 		s.mu.Lock()
 		delete(s.pendingApps, args.LeaderId)
 		s.mu.Unlock()
 		return fmt.Errorf("timeout waiting for append processing")
+
 	case <-s.stopCh:
 		return ErrStopped
 	}
