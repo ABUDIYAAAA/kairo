@@ -30,17 +30,34 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    uint64 // currentTerm, for leader to update itself
 	Success bool   // true if follower contained entry matching prevLogIndex and prevLogTerm
+	MatchIndex uint64 // index of last matching entry on success or conflict hint
+}
+
+// InstallSnapshotArgs is sent by leaders to send chunks/full snapshots to lagging followers (Raft Paper, §7).
+type InstallSnapshotArgs struct {
+	Term              uint64 // leader's term
+	LeaderId          int    // so follower can redirect clients
+	LastIncludedIndex uint64 // snapshot replaces all entries up through and including this index
+	LastIncludedTerm  uint64 // term of LastIncludedIndex
+	Data              []byte // raw snapshot data
+}
+
+// InstallSnapshotReply is the response to an InstallSnapshot RPC.
+type InstallSnapshotReply struct {
+	Term uint64 // currentTerm, for leader to update itself
 }
 
 // RaftHandler defines the methods a Raft node must implement to receive RPCs.
 type RaftHandler interface {
 	RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error
+	InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
 }
 
 // Transport defines the client-side interface for sending RPCs to peer nodes.
 type Transport interface {
 	RequestVote(addr string, args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(addr string, args *AppendEntriesArgs, reply *AppendEntriesReply) error
+	InstallSnapshot(addr string, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
 	Close() error
 }

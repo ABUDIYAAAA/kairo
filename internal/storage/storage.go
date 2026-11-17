@@ -56,6 +56,16 @@ type Storage interface {
 	// GetState returns the persisted currentTerm and votedFor.
 	GetState() (currentTerm uint64, votedFor int, err error)
 
+	// SaveSnapshot persists snapshot metadata and state machine bytes to stable storage synchronously.
+	SaveSnapshot(meta SnapshotMeta, data []byte) error
+
+	// GetSnapshot returns the latest persisted snapshot metadata and data, or nil if no snapshot exists.
+	GetSnapshot() (*SnapshotMeta, []byte, error)
+
+	// Compact discards all log entries up through compactIndex (inclusive),
+	// retaining the entry at compactIndex as the baseline sentinel.
+	Compact(compactIndex uint64) error
+
 	// Close flushes and closes any open file handles.
 	Close() error
 }

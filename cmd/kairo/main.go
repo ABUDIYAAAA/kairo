@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ABUDIYAAAA/kairo/internal/raft"
+	"github.com/ABUDIYAAAA/kairo/internal/state"
 	"github.com/ABUDIYAAAA/kairo/internal/storage"
 	"github.com/ABUDIYAAAA/kairo/internal/transport"
 )
@@ -64,10 +70,147 @@ func setupLogger(levelStr, formatStr string) {
 	slog.SetDefault(logger)
 }
 
+func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node_id":   rs.ID(),
+			"role":      string(rs.Role()),
+			"term":      rs.Term(),
+			"leader_id": rs.Leader(),
+		})
+	})
+
+	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, `{"error":"key required"}`, http.StatusBadRequest)
+			return
+		}
+		item, err := rs.Get(key)
+		if err != nil {
+			if errors.Is(err, state.ErrKeyNotFound) {
+				http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+			} else {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"key":          key,
+			"value":        item.Value,
+			"version":      item.Version,
+			"mod_revision": item.ModRevision,
+		})
+	})
+
+	mux.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
+			http.Error(w, `{"error":"invalid JSON, key and value required"}`, http.StatusBadRequest)
+			return
+		}
+		item, err := rs.Put(req.Key, req.Value)
+		if err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":     "not leader",
+					"leader_id": rs.Leader(),
+				})
+			} else {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":       "ok",
+			"key":          req.Key,
+			"value":        item.Value,
+			"version":      item.Version,
+			"mod_revision": item.ModRevision,
+		})
+	})
+
+	mux.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"POST required"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
+			http.Error(w, `{"error":"invalid JSON, key required"}`, http.StatusBadRequest)
+			return
+		}
+		item, err := rs.Delete(req.Key)
+		if err != nil {
+			if errors.Is(err, raft.ErrNotLeader) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":     "not leader",
+					"leader_id": rs.Leader(),
+				})
+			} else if errors.Is(err, state.ErrKeyNotFound) {
+				http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+			} else {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":       "deleted",
+			"key":          req.Key,
+			"value":        item.Value,
+			"version":      item.Version,
+			"mod_revision": item.ModRevision,
+		})
+	})
+
+	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if err := rs.Snapshot(); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+		})
+	})
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("client HTTP server failed", "addr", addr, "error", err)
+		}
+	}()
+
+	return server
+}
+
 func main() {
 	nodeID := flag.Int("id", 1, "Unique Node ID (e.g. 1, 2, 3)")
 	addr := flag.String("addr", "127.0.0.1:8001", "Internal Raft peer address to listen on (host:port)")
-	clientAddr := flag.String("client-addr", "127.0.0.1:9001", "Outside client port/address (reserved for KV client traffic)")
+	clientAddr := flag.String("client-addr", "127.0.0.1:9001", "Outside client port/address for HTTP KV traffic")
 	peersStr := flag.String("peers", "", "Comma-separated peer mappings (e.g. '2=127.0.0.1:8002,3=127.0.0.1:8003')")
 	dataDir := flag.String("data-dir", "", "Persistent storage directory for Raft log and hard state")
 	logLevel := flag.String("log-level", "info", "Logging level: debug, info, warn, error")
@@ -129,7 +272,18 @@ func main() {
 	}
 	defer srv.Close()
 
-	slog.Info("node initialized and running", "node_id", *nodeID)
+	// 5. Start HTTP client server for linearizable KV operations
+	httpSrv := startClientHTTP(*clientAddr, rServer)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(ctx)
+	}()
+
+	slog.Info("node initialized and running",
+		slog.Int("node_id", *nodeID),
+		slog.String("client_api", *clientAddr),
+	)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

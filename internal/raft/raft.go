@@ -1,19 +1,23 @@
 package raft
 
 import (
+	"errors"
 	"math/rand"
 
 	"github.com/ABUDIYAAAA/kairo/internal/state"
 	"github.com/ABUDIYAAAA/kairo/internal/storage"
 )
 
+var (
+	ErrNotLeader = errors.New("raft: not leader")
+)
+
 // Raft is a pure, deterministic finite state machine implementing the Raft protocol.
-// Following etcd/raft's design:
+// Mirroring etcd/raft:
 // - ZERO goroutines inside.
 // - ZERO network I/O inside.
 // - ZERO disk I/O inside.
 // - ZERO mutexes inside.
-// All interactions are driven through Step(msg), Tick(), and Ready().
 type Raft struct {
 	id    int
 	peers []int
@@ -24,7 +28,12 @@ type Raft struct {
 	// Persistent state on all servers (Raft Paper, Figure 2)
 	currentTerm uint64
 	votedFor    int
-	entries     []storage.LogEntry // 1-based indexing; entries[0] is sentinel (Index 0, Term 0)
+
+	// Log management with snapshot compaction offset (Raft §7)
+	entries       []storage.LogEntry // entries[0] is baseline sentinel (Index: snapshotIndex, Term: snapshotTerm)
+	snapshotIndex uint64
+	snapshotTerm  uint64
+	snapshotData  []byte
 
 	// Volatile state on all servers
 	commitIndex uint64
@@ -33,18 +42,19 @@ type Raft struct {
 	// Volatile state on leaders
 	nextIndex  map[int]uint64
 	matchIndex map[int]uint64
-	votes      map[int]bool // Candidate vote tracking
+	votes      map[int]bool
 
-	// Ticks and timeouts (logical clock, no wall clock sleeps)
+	// Ticks and timeouts (logical clock)
 	electionElapsed  int
 	heartbeatElapsed int
-	electionTimeout  int // randomized per election cycle
+	electionTimeout  int
 	heartbeatTimeout int
 
 	// Staging outbox for Ready batch
 	msgs              []Message
 	unstableHardState *storage.HardState
 	unstableEntries   []storage.LogEntry
+	unstableSnapshot  *Snapshot
 
 	// Tracking soft state transitions
 	lastSoftState SoftState
@@ -55,13 +65,15 @@ type Config struct {
 	ID    int
 	Peers []int
 
-	// Persistent state loaded from storage before start
-	CurrentTerm uint64
-	VotedFor    int
-	Entries     []storage.LogEntry
+	CurrentTerm       uint64
+	VotedFor          int
+	Entries           []storage.LogEntry
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	SnapshotData      []byte
 
-	ElectionTimeout  int // e.g. 10 ticks
-	HeartbeatTimeout int // e.g. 2 ticks
+	ElectionTimeout  int
+	HeartbeatTimeout int
 }
 
 // NewRaft creates an initialized pure Raft state machine.
@@ -73,10 +85,13 @@ func NewRaft(c Config) *Raft {
 		c.HeartbeatTimeout = 2
 	}
 
+	snapIdx := c.LastIncludedIndex
+	snapTerm := c.LastIncludedTerm
+
 	entries := c.Entries
-	if len(entries) == 0 || entries[0].Index != 0 {
-		// Ensure sentinel entry at index 0
-		entries = append([]storage.LogEntry{{Index: 0, Term: 0}}, entries...)
+	if len(entries) == 0 || entries[0].Index != snapIdx {
+		sentinel := storage.LogEntry{Index: snapIdx, Term: snapTerm}
+		entries = append([]storage.LogEntry{sentinel}, entries...)
 	}
 
 	r := &Raft{
@@ -87,8 +102,11 @@ func NewRaft(c Config) *Raft {
 		currentTerm:      c.CurrentTerm,
 		votedFor:         c.VotedFor,
 		entries:          entries,
-		commitIndex:      0,
-		lastApplied:      0,
+		snapshotIndex:    snapIdx,
+		snapshotTerm:     snapTerm,
+		snapshotData:     c.SnapshotData,
+		commitIndex:      snapIdx,
+		lastApplied:      snapIdx,
 		nextIndex:        make(map[int]uint64),
 		matchIndex:       make(map[int]uint64),
 		votes:            make(map[int]bool),
@@ -101,7 +119,6 @@ func NewRaft(c Config) *Raft {
 }
 
 func (r *Raft) resetRandomElectionTimeout(base int) {
-	// Raft §5.2: randomize election timeout (e.g. base to 2*base ticks)
 	r.electionTimeout = base + rand.Intn(base)
 }
 
@@ -142,12 +159,28 @@ func (r *Raft) Step(m Message) error {
 			r.bcastAppend()
 		}
 
+	case MsgProp:
+		// Client proposal (Raft §5.3)
+		if r.role != state.Leader {
+			return ErrNotLeader
+		}
+		if len(m.Entries) > 0 {
+			for _, entry := range m.Entries {
+				newEntry := storage.LogEntry{
+					Index: r.lastIndex() + 1,
+					Term:  r.currentTerm,
+					Data:  entry.Data,
+				}
+				r.entries = append(r.entries, newEntry)
+				r.unstableEntries = append(r.unstableEntries, newEntry)
+			}
+			r.matchIndex[r.id] = r.lastIndex()
+			r.bcastAppend()
+		}
+
 	case MsgVote:
-		// Candidate requesting vote
 		canVote := (r.votedFor == storage.NoVote || r.votedFor == m.From)
 		lastIdx, lastTerm := r.lastLog()
-
-		// Raft §5.4: candidate's log must be at least as up-to-date as receiver's
 		logOk := (m.LogTerm > lastTerm) || (m.LogTerm == lastTerm && m.Index >= lastIdx)
 
 		if m.Term < r.currentTerm {
@@ -171,7 +204,6 @@ func (r *Raft) Step(m Message) error {
 				}
 			}
 
-			// Raft §5.2: majority check
 			totalNodes := len(r.peers) + 1
 			majority := totalNodes/2 + 1
 			if granted >= majority {
@@ -181,9 +213,8 @@ func (r *Raft) Step(m Message) error {
 		}
 
 	case MsgApp:
-		// AppendEntries / Heartbeat from leader
 		if m.Term < r.currentTerm {
-			r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: true})
+			r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: true, Index: r.lastIndex()})
 			return nil
 		}
 
@@ -194,18 +225,125 @@ func (r *Raft) Step(m Message) error {
 		}
 		r.electionElapsed = 0
 
-		r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: false, Index: m.Index})
+		// Consistency check (§5.3)
+		if m.Index > r.lastIndex() {
+			r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: true, Index: r.lastIndex()})
+			return nil
+		}
+
+		if m.Index >= r.snapshotIndex && r.termAt(m.Index) != m.LogTerm {
+			r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: true, Index: r.lastIndex()})
+			return nil
+		}
+
+		// Append any new entries not already in the log (§5.3)
+		for _, entry := range m.Entries {
+			if entry.Index <= r.lastIndex() {
+				if r.termAt(entry.Index) != entry.Term {
+					r.truncate(entry.Index)
+					r.entries = append(r.entries, entry)
+					r.unstableEntries = append(r.unstableEntries, entry)
+				}
+			} else if entry.Index == r.lastIndex()+1 {
+				r.entries = append(r.entries, entry)
+				r.unstableEntries = append(r.unstableEntries, entry)
+			}
+		}
+
+		// Update commitIndex (§5.3)
+		if m.Commit > r.commitIndex {
+			r.commitIndex = min(m.Commit, r.lastIndex())
+		}
+
+		r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: false, Index: r.lastIndex()})
 
 	case MsgAppResp:
 		if r.role == state.Leader && m.Term == r.currentTerm {
-			if !m.Reject {
+			if m.Reject {
+				// Follower rejected, backtrack nextIndex
+				if r.nextIndex[m.From] > 1 {
+					r.nextIndex[m.From] = min(m.Index+1, r.nextIndex[m.From]-1)
+				}
+				r.sendAppendTo(m.From)
+			} else {
+				// Success, update matchIndex and nextIndex
 				r.matchIndex[m.From] = m.Index
 				r.nextIndex[m.From] = m.Index + 1
+
+				// Check quorum commit (§5.3, §5.4)
+				r.maybeCommit()
 			}
+		}
+
+	case MsgSnap:
+		// InstallSnapshot RPC (§7)
+		if m.Term < r.currentTerm {
+			r.send(Message{To: m.From, From: r.id, Type: MsgSnapResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
+		if r.role != state.Follower {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.lead = m.From
+		}
+		r.electionElapsed = 0
+
+		if m.Snapshot != nil {
+			meta := m.Snapshot.Metadata
+			if meta.LastIncludedIndex > r.snapshotIndex {
+				r.snapshotIndex = meta.LastIncludedIndex
+				r.snapshotTerm = meta.LastIncludedTerm
+				r.snapshotData = m.Snapshot.Data
+
+				// Reset log with new snapshot baseline sentinel
+				r.entries = []storage.LogEntry{{Index: r.snapshotIndex, Term: r.snapshotTerm}}
+				r.commitIndex = r.snapshotIndex
+				r.lastApplied = r.snapshotIndex
+				r.unstableSnapshot = m.Snapshot
+			}
+		}
+
+		r.send(Message{To: m.From, From: r.id, Type: MsgSnapResp, Term: r.currentTerm, Reject: false})
+
+	case MsgSnapResp:
+		if m.Term > r.currentTerm {
+			r.becomeFollower(m.Term, storage.NoVote)
+			return nil
+		}
+		if r.role == state.Leader && m.Term == r.currentTerm && !m.Reject {
+			r.matchIndex[m.From] = r.snapshotIndex
+			r.nextIndex[m.From] = r.snapshotIndex + 1
+			r.maybeCommit()
 		}
 	}
 
 	return nil
+}
+
+func (r *Raft) maybeCommit() {
+	// Leader commits entry N if majority of matchIndex[i] >= N and termAt(N) == currentTerm (§5.3, §5.4)
+	totalNodes := len(r.peers) + 1
+	majority := totalNodes/2 + 1
+
+	for n := r.lastIndex(); n > r.commitIndex; n-- {
+		if r.termAt(n) != r.currentTerm {
+			continue
+		}
+
+		matches := 1 // self
+		for _, peer := range r.peers {
+			if r.matchIndex[peer] >= n {
+				matches++
+			}
+		}
+
+		if matches >= majority {
+			r.commitIndex = n
+			r.bcastAppend()
+			break
+		}
+	}
 }
 
 func (r *Raft) campaign() {
@@ -229,18 +367,53 @@ func (r *Raft) campaign() {
 }
 
 func (r *Raft) bcastAppend() {
-	lastIdx, lastTerm := r.lastLog()
 	for _, peer := range r.peers {
-		r.send(Message{
-			To:      peer,
-			From:    r.id,
-			Type:    MsgApp,
-			Term:    r.currentTerm,
-			LogTerm: lastTerm,
-			Index:   lastIdx,
-			Commit:  r.commitIndex,
-		})
+		r.sendAppendTo(peer)
 	}
+}
+
+func (r *Raft) sendAppendTo(peer int) {
+	next := r.nextIndex[peer]
+	if next == 0 {
+		next = 1
+	}
+
+	prevIndex := next - 1
+	if prevIndex < r.snapshotIndex {
+		// Peer requires compacted log entries; send InstallSnapshot instead (§7)
+		r.send(Message{
+			To:   peer,
+			From: r.id,
+			Type: MsgSnap,
+			Term: r.currentTerm,
+			Snapshot: &Snapshot{
+				Metadata: storage.SnapshotMeta{
+					LastIncludedIndex: r.snapshotIndex,
+					LastIncludedTerm:  r.snapshotTerm,
+				},
+				Data: r.snapshotData,
+			},
+		})
+		return
+	}
+
+	prevTerm := r.termAt(prevIndex)
+	var entriesToSend []storage.LogEntry
+	if next <= r.lastIndex() {
+		sliceStart := next - r.snapshotIndex
+		entriesToSend = append(entriesToSend, r.entries[sliceStart:]...)
+	}
+
+	r.send(Message{
+		To:      peer,
+		From:    r.id,
+		Type:    MsgApp,
+		Term:    r.currentTerm,
+		LogTerm: prevTerm,
+		Index:   prevIndex,
+		Entries: entriesToSend,
+		Commit:  r.commitIndex,
+	})
 }
 
 func (r *Raft) becomeCandidate() {
@@ -266,16 +439,65 @@ func (r *Raft) becomeFollower(term uint64, lead int) {
 func (r *Raft) becomeLeader() {
 	r.role = state.Leader
 	r.lead = r.id
-	lastIdx, _ := r.lastLog()
+
+	lastIdx := r.lastIndex()
 	for _, peer := range r.peers {
 		r.nextIndex[peer] = lastIdx + 1
 		r.matchIndex[peer] = 0
 	}
 	r.heartbeatElapsed = 0
+
+	// Raft Paper §8: Leader appends blank entry at start of its term to establish commit boundary
+	noOpEntry := storage.LogEntry{
+		Index: lastIdx + 1,
+		Term:  r.currentTerm,
+		Data:  nil,
+	}
+	r.entries = append(r.entries, noOpEntry)
+	r.unstableEntries = append(r.unstableEntries, noOpEntry)
+	r.matchIndex[r.id] = noOpEntry.Index
+}
+
+func (r *Raft) truncate(fromIndex uint64) {
+	if fromIndex <= r.snapshotIndex {
+		return
+	}
+	sliceIdx := fromIndex - r.snapshotIndex
+	if sliceIdx < uint64(len(r.entries)) {
+		r.entries = r.entries[:sliceIdx]
+	}
+}
+
+// CompactLog discards entries up to compactIndex (Raft §7).
+func (r *Raft) CompactLog(meta storage.SnapshotMeta, data []byte) {
+	if meta.LastIncludedIndex <= r.snapshotIndex {
+		return
+	}
+
+	r.snapshotIndex = meta.LastIncludedIndex
+	r.snapshotTerm = meta.LastIncludedTerm
+	r.snapshotData = data
+
+	var retained []storage.LogEntry
+	if r.lastIndex() > r.snapshotIndex {
+		sliceStart := r.snapshotIndex - r.entries[0].Index + 1
+		if sliceStart < uint64(len(r.entries)) {
+			retained = r.entries[sliceStart:]
+		}
+	}
+
+	newEntries := make([]storage.LogEntry, 1+len(retained))
+	newEntries[0] = storage.LogEntry{Index: r.snapshotIndex, Term: r.snapshotTerm}
+	copy(newEntries[1:], retained)
+	r.entries = newEntries
 }
 
 func (r *Raft) send(m Message) {
 	r.msgs = append(r.msgs, m)
+}
+
+func (r *Raft) lastIndex() uint64 {
+	return r.entries[len(r.entries)-1].Index
 }
 
 func (r *Raft) lastLog() (uint64, uint64) {
@@ -283,13 +505,43 @@ func (r *Raft) lastLog() (uint64, uint64) {
 	return last.Index, last.Term
 }
 
+func (r *Raft) termAt(index uint64) uint64 {
+	if index == r.snapshotIndex {
+		return r.snapshotTerm
+	}
+	if index < r.snapshotIndex || index > r.lastIndex() {
+		return 0
+	}
+	return r.entries[index-r.snapshotIndex].Term
+}
+
 func (r *Raft) softStateChanged() bool {
 	return r.lead != r.lastSoftState.Lead || r.role != r.lastSoftState.Role
 }
 
-// HasReady returns true if there is pending state, entries, or messages to be processed.
+func (r *Raft) newCommittedEntries() []storage.LogEntry {
+	if r.commitIndex > r.lastApplied {
+		start := r.lastApplied + 1
+		end := r.commitIndex + 1
+		if start <= r.snapshotIndex {
+			start = r.snapshotIndex + 1
+		}
+		if start < end && start <= r.lastIndex() {
+			sliceStart := start - r.snapshotIndex
+			sliceEnd := end - r.snapshotIndex
+			if sliceEnd > uint64(len(r.entries)) {
+				sliceEnd = uint64(len(r.entries))
+			}
+			return r.entries[sliceStart:sliceEnd]
+		}
+	}
+	return nil
+}
+
+// HasReady returns true if there is pending state, entries, snapshot, or messages.
 func (r *Raft) HasReady() bool {
-	return len(r.msgs) > 0 || r.unstableHardState != nil || len(r.unstableEntries) > 0 || r.softStateChanged()
+	return len(r.msgs) > 0 || r.unstableHardState != nil || len(r.unstableEntries) > 0 ||
+		r.unstableSnapshot != nil || len(r.newCommittedEntries()) > 0 || r.softStateChanged()
 }
 
 // Ready creates the point-in-time Ready batch.
@@ -297,7 +549,8 @@ func (r *Raft) Ready() Ready {
 	rd := Ready{
 		HardState:        r.unstableHardState,
 		Entries:          r.unstableEntries,
-		CommittedEntries: nil,
+		Snapshot:         r.unstableSnapshot,
+		CommittedEntries: r.newCommittedEntries(),
 		Messages:         r.msgs,
 	}
 	if r.softStateChanged() {
@@ -311,25 +564,35 @@ func (r *Raft) Ready() Ready {
 func (r *Raft) Advance() {
 	r.unstableHardState = nil
 	r.unstableEntries = nil
+	r.unstableSnapshot = nil
 	r.msgs = nil
+	r.lastApplied = r.commitIndex
 }
 
-// ID returns node id.
 func (r *Raft) ID() int {
 	return r.id
 }
 
-// Role returns current role.
 func (r *Raft) Role() state.Role {
 	return r.role
 }
 
-// Term returns current term.
 func (r *Raft) Term() uint64 {
 	return r.currentTerm
 }
 
-// Lead returns current leader ID.
 func (r *Raft) Lead() int {
 	return r.lead
+}
+
+func (r *Raft) CommitIndex() uint64 {
+	return r.commitIndex
+}
+
+func (r *Raft) Applied() uint64 {
+	return r.lastApplied
+}
+
+func (r *Raft) LastIndex() uint64 {
+	return r.lastIndex()
 }

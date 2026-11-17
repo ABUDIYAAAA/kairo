@@ -156,6 +156,24 @@ func (st *SimulatedTransport) AppendEntries(addr string, args *transport.AppendE
 	return dest.AppendEntries(&argsCopy, reply)
 }
 
+func (st *SimulatedTransport) InstallSnapshot(addr string, args *transport.InstallSnapshotArgs, reply *transport.InstallSnapshotReply) error {
+	dest, ok := st.net.isDeliverable(st.fromAddr, addr)
+	if !ok {
+		return errors.New("simulated network: packet dropped or host unreachable")
+	}
+
+	st.net.mu.RLock()
+	minD, maxD := st.net.minDelay, st.net.maxDelay
+	st.net.mu.RUnlock()
+	if maxD > 0 {
+		delay := minD + time.Duration(rand.Int63n(int64(maxD-minD+1)))
+		time.Sleep(delay)
+	}
+
+	argsCopy := *args
+	return dest.InstallSnapshot(&argsCopy, reply)
+}
+
 func (st *SimulatedTransport) Close() error {
 	return nil
 }
@@ -434,4 +452,154 @@ func TestSimulationChaosMonkeyPartitions(t *testing.T) {
 
 	leader, term := h.WaitSingleLeader(t, 5*time.Second)
 	t.Logf("PASS: Survived Chaos Monkey partition churn, stabilized to Leader %d for Term %d", leader, term)
+}
+
+func TestSimulationLogReplication(t *testing.T) {
+	h, err := NewClusterHarness(5)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, term := h.WaitSingleLeader(t, 4*time.Second)
+	t.Logf("Elected Leader Node %d in Term %d", leaderID, term)
+	leader := h.nodes[leaderID]
+
+	// 1. Propose keys to leader
+	for i := 1; i <= 5; i++ {
+		key := fmt.Sprintf("sim-key-%d", i)
+		val := fmt.Sprintf("sim-val-%d", i)
+		item, err := leader.Put(key, val)
+		if err != nil {
+			t.Fatalf("Put %s failed: %v", key, err)
+		}
+		if item.Value != val || item.Version != 1 || item.ModRevision != uint64(i) {
+			t.Fatalf("unexpected item metadata on Put: %+v", item)
+		}
+	}
+
+	// 2. Allow replication to converge across all 5 nodes
+	time.Sleep(300 * time.Millisecond)
+	for id, node := range h.nodes {
+		for i := 1; i <= 5; i++ {
+			key := fmt.Sprintf("sim-key-%d", i)
+			expected := fmt.Sprintf("sim-val-%d", i)
+			item, err := node.Get(key)
+			if err != nil {
+				t.Fatalf("node %d failed to get %s: %v", id, key, err)
+			}
+			if item.Value != expected {
+				t.Fatalf("node %d key %s mismatch: expected %s, got %s", id, key, expected, item.Value)
+			}
+		}
+	}
+
+	// 3. Propose Delete
+	delItem, err := leader.Delete("sim-key-3")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	if delItem.Value != "sim-val-3" {
+		t.Fatalf("Delete returned wrong item: %+v", delItem)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	for id, node := range h.nodes {
+		_, err := node.Get("sim-key-3")
+		if !errors.Is(err, state.ErrKeyNotFound) {
+			t.Fatalf("node %d expected ErrKeyNotFound for sim-key-3, got %v", id, err)
+		}
+	}
+	t.Logf("PASS: Log replication and deletion verified across all 5 nodes")
+}
+
+func TestSimulationLogCompactionCatchUp(t *testing.T) {
+	h, err := NewClusterHarness(3)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, _ := h.WaitSingleLeader(t, 4*time.Second)
+	leader := h.nodes[leaderID]
+
+	// Identify follower to partition
+	var slowNodeID int
+	for id := range h.nodes {
+		if id != leaderID {
+			slowNodeID = id
+			break
+		}
+	}
+
+	// 1. Disconnect slow node
+	t.Logf("Disconnecting slow follower Node %d", slowNodeID)
+	h.net.Disconnect(slowNodeID)
+
+	// 2. Leader and remaining node commit 20 entries
+	for i := 1; i <= 20; i++ {
+		key := fmt.Sprintf("batch-key-%d", i)
+		val := fmt.Sprintf("batch-val-%d", i)
+		_, err := leader.Put(key, val)
+		if err != nil {
+			t.Fatalf("Put on majority partition failed: %v", err)
+		}
+	}
+
+	// 3. Leader takes a snapshot and compacts log
+	t.Logf("Taking snapshot and compacting WAL on Leader Node %d", leaderID)
+	if err := leader.Snapshot(); err != nil {
+		t.Fatalf("leader snapshot failed: %v", err)
+	}
+
+	// 4. Reconnect slow follower
+	t.Logf("Reconnecting slow follower Node %d; Leader should send InstallSnapshot", slowNodeID)
+	h.net.Reconnect(slowNodeID)
+
+	// 5. Wait for snapshot installation and replication catch up
+	slowNode := h.nodes[slowNodeID]
+	deadline := time.Now().Add(4 * time.Second)
+	caughtUp := false
+	for time.Now().Before(deadline) {
+		item, err := slowNode.Get("batch-key-20")
+		if err == nil && item.Value == "batch-val-20" {
+			caughtUp = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !caughtUp {
+		t.Fatalf("timed out waiting for slow follower Node %d to catch up via InstallSnapshot", slowNodeID)
+	}
+
+	// Verify all 20 keys match on the slow follower
+	for i := 1; i <= 20; i++ {
+		key := fmt.Sprintf("batch-key-%d", i)
+		expected := fmt.Sprintf("batch-val-%d", i)
+		item, err := slowNode.Get(key)
+		if err != nil {
+			t.Fatalf("follower Node %d missing %s: %v", slowNodeID, key, err)
+		}
+		if item.Value != expected {
+			t.Fatalf("follower Node %d %s mismatch: expected %s, got %s", slowNodeID, key, expected, item.Value)
+		}
+	}
+
+	// 6. Propose a new key after catch-up to ensure normal replication proceeds
+	currLeaderID, _ := h.WaitSingleLeader(t, 4*time.Second)
+	currLeader := h.nodes[currLeaderID]
+	item, err := currLeader.Put("post-snap-key", "post-snap-val")
+	if err != nil {
+		t.Fatalf("post-snapshot Put failed: %v", err)
+	}
+	if item.Value != "post-snap-val" {
+		t.Fatalf("post-snapshot Put value mismatch: %+v", item)
+	}
+	time.Sleep(200 * time.Millisecond)
+	got, err := slowNode.Get("post-snap-key")
+	if err != nil || got.Value != "post-snap-val" {
+		t.Fatalf("slow follower failed to replicate post-snapshot entry: %v, got %+v", err, got)
+	}
+
+	t.Logf("PASS: Slow node caught up via snapshot and resumed continuous replication")
 }

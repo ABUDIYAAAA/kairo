@@ -217,6 +217,75 @@ func TestFileStorageTornWriteRecovery(t *testing.T) {
 	}
 }
 
+func TestFileStorageSnapshotAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+
+	fs, err := OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("failed to open file storage: %v", err)
+	}
+
+	entries := []LogEntry{
+		{Index: 1, Term: 1, Data: []byte("cmd1")},
+		{Index: 2, Term: 1, Data: []byte("cmd2")},
+		{Index: 3, Term: 2, Data: []byte("cmd3")},
+		{Index: 4, Term: 2, Data: []byte("cmd4")},
+		{Index: 5, Term: 3, Data: []byte("cmd5")},
+	}
+	if err := fs.Append(entries...); err != nil {
+		t.Fatalf("failed to append: %v", err)
+	}
+
+	// Save snapshot at index 3, term 2
+	meta := SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 2}
+	snapData := []byte(`{"k1":"v1"}`)
+	if err := fs.SaveSnapshot(meta, snapData); err != nil {
+		t.Fatalf("failed to save snapshot: %v", err)
+	}
+
+	if fs.FirstIndex() != 4 {
+		t.Fatalf("expected first index 4 after compaction, got %d", fs.FirstIndex())
+	}
+	if fs.LastIndex() != 5 {
+		t.Fatalf("expected last index 5, got %d", fs.LastIndex())
+	}
+
+	// Indices 1, 2 should be gone
+	if _, err := fs.GetEntry(2); err != ErrEntryNotFound {
+		t.Fatalf("expected ErrEntryNotFound for compacted index 2, got %v", err)
+	}
+
+	// Index 3 term lookup should return baseline term
+	term3, err := fs.Term(3)
+	if err != nil || term3 != 2 {
+		t.Fatalf("expected term 2 for baseline index 3, got %d, err %v", term3, err)
+	}
+
+	// Indices 4 and 5 should still be present
+	e4, err := fs.GetEntry(4)
+	if err != nil || string(e4.Data) != "cmd4" {
+		t.Fatalf("unexpected entry 4: %+v, err %v", e4, err)
+	}
+
+	// Close and reopen from disk (recovery of snapshot + compacted log)
+	_ = fs.Close()
+
+	recoveredFS, err := OpenFileStorage(dir)
+	if err != nil {
+		t.Fatalf("failed to reopen compacted storage: %v", err)
+	}
+	defer recoveredFS.Close()
+
+	if recoveredFS.FirstIndex() != 4 || recoveredFS.LastIndex() != 5 {
+		t.Fatalf("unexpected bounds after recovery: first=%d, last=%d", recoveredFS.FirstIndex(), recoveredFS.LastIndex())
+	}
+
+	recoveredMeta, recoveredData, err := recoveredFS.GetSnapshot()
+	if err != nil || recoveredMeta == nil || recoveredMeta.LastIncludedIndex != 3 || string(recoveredData) != `{"k1":"v1"}` {
+		t.Fatalf("unexpected recovered snapshot: meta=%+v, data=%s, err=%v", recoveredMeta, string(recoveredData), err)
+	}
+}
+
 func TestMemoryStorage(t *testing.T) {
 	ms := NewMemoryStorage()
 

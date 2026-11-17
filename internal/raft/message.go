@@ -14,12 +14,15 @@ const (
 	// Internal / local triggers
 	MsgHup MessageType = iota
 	MsgBeat
+	MsgProp // Local client proposal
 
-	// RPC protocol messages (Raft Paper, Figure 2)
+	// RPC protocol messages (Raft Paper, Figure 2 & §7)
 	MsgVote
 	MsgVoteResp
 	MsgApp
 	MsgAppResp
+	MsgSnap
+	MsgSnapResp
 )
 
 func (t MessageType) String() string {
@@ -28,6 +31,8 @@ func (t MessageType) String() string {
 		return "MsgHup"
 	case MsgBeat:
 		return "MsgBeat"
+	case MsgProp:
+		return "MsgProp"
 	case MsgVote:
 		return "MsgVote"
 	case MsgVoteResp:
@@ -36,23 +41,34 @@ func (t MessageType) String() string {
 		return "MsgApp"
 	case MsgAppResp:
 		return "MsgAppResp"
+	case MsgSnap:
+		return "MsgSnap"
+	case MsgSnapResp:
+		return "MsgSnapResp"
 	default:
 		return fmt.Sprintf("MessageType(%d)", t)
 	}
 }
 
+// Snapshot carries state machine snapshot data and boundary metadata (Raft §7).
+type Snapshot struct {
+	Metadata storage.SnapshotMeta `json:"metadata"`
+	Data     []byte               `json:"data"`
+}
+
 // Message is the universal message struct used for all communication in Raft,
 // mirroring etcd/raft's message structure.
 type Message struct {
-	Type    MessageType        `json:"type"`
-	To      int                `json:"to"`
-	From    int                `json:"from"`
-	Term    uint64             `json:"term"`
-	LogTerm uint64             `json:"log_term"`
-	Index   uint64             `json:"index"`
-	Entries []storage.LogEntry `json:"entries,omitempty"`
-	Commit  uint64             `json:"commit"`
-	Reject  bool               `json:"reject"`
+	Type     MessageType        `json:"type"`
+	To       int                `json:"to"`
+	From     int                `json:"from"`
+	Term     uint64             `json:"term"`
+	LogTerm  uint64             `json:"log_term"`
+	Index    uint64             `json:"index"`
+	Entries  []storage.LogEntry `json:"entries,omitempty"`
+	Commit   uint64             `json:"commit"`
+	Snapshot *Snapshot          `json:"snapshot,omitempty"`
+	Reject   bool               `json:"reject"`
 }
 
 // SoftState contains volatile state that does not need to be written to disk.
@@ -62,10 +78,6 @@ type SoftState struct {
 }
 
 // Ready encapsulates the point-in-time entries and messages ready to be processed.
-// In strict accordance with etcd/raft architecture:
-// 1. HardState and Entries MUST be persisted to stable storage (fsync).
-// 2. Messages MUST be sent to peers AFTER Entries & HardState are saved.
-// 3. CommittedEntries MUST be applied to the state machine.
 type Ready struct {
 	SoftState *SoftState
 
@@ -74,6 +86,9 @@ type Ready struct {
 
 	// Entries to save to stable storage synchronously (WAL).
 	Entries []storage.LogEntry
+
+	// Snapshot to persist and apply if non-nil.
+	Snapshot *Snapshot
 
 	// CommittedEntries to apply to state machine.
 	CommittedEntries []storage.LogEntry

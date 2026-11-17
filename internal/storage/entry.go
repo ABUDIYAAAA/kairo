@@ -25,3 +25,9 @@ type HardState struct {
 	CurrentTerm uint64 `json:"current_term"`
 	VotedFor    int    `json:"voted_for"`
 }
+
+// SnapshotMeta contains the boundary metadata for a Raft snapshot (Raft Paper, §7).
+type SnapshotMeta struct {
+	LastIncludedIndex uint64 `json:"last_included_index"`
+	LastIncludedTerm  uint64 `json:"last_included_term"`
+}

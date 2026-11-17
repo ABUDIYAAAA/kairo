@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/ABUDIYAAAA/kairo/internal/state"
+	"github.com/ABUDIYAAAA/kairo/internal/storage"
 )
 
 var ErrStopped = errors.New("raft: node stopped")
@@ -142,4 +143,45 @@ func (n *Node) Lead() int {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.raft.Lead()
+}
+
+// CommitIndex returns the highest committed log index known.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.CommitIndex()
+}
+
+// Applied returns the highest applied log index.
+func (n *Node) Applied() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.Applied()
+}
+
+// LastIndex returns the last log entry index in the state machine.
+func (n *Node) LastIndex() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.LastIndex()
+}
+
+// Propose submits a log entry payload to be replicated across the Raft cluster.
+func (n *Node) Propose(data []byte) error {
+	n.mu.RLock()
+	id := n.raft.ID()
+	n.mu.RUnlock()
+
+	return n.Step(Message{
+		Type:    MsgProp,
+		From:    id,
+		Entries: []storage.LogEntry{{Data: data}},
+	})
+}
+
+// CompactLog informs the Raft state machine of a discarded log prefix up to meta.LastIncludedIndex.
+func (n *Node) CompactLog(meta storage.SnapshotMeta, data []byte) {
+	n.mu.Lock()
+	n.raft.CompactLog(meta, data)
+	n.mu.Unlock()
 }

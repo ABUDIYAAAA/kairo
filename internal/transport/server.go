@@ -136,6 +136,11 @@ func (c *Client) AppendEntries(addr string, args *AppendEntriesArgs, reply *Appe
 	return c.call(addr, "Raft.AppendEntries", args, reply)
 }
 
+// InstallSnapshot sends an InstallSnapshot RPC to the peer at addr using a persistent connection.
+func (c *Client) InstallSnapshot(addr string, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	return c.call(addr, "Raft.InstallSnapshot", args, reply)
+}
+
 // getOrCreateClient returns an existing active RPC client or establishes a new persistent connection.
 func (c *Client) getOrCreateClient(addr string) (*rpc.Client, error) {
 	c.mu.Lock()

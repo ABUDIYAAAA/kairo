@@ -8,10 +8,12 @@ import (
 // MemoryStorage is an in-memory implementation of the Storage interface,
 // primarily useful for unit testing, deterministic simulations, and benchmarks.
 type MemoryStorage struct {
-	mu          sync.RWMutex
-	entries     []LogEntry
-	currentTerm uint64
-	votedFor    int
+	mu           sync.RWMutex
+	entries      []LogEntry
+	currentTerm  uint64
+	votedFor     int
+	snapshotMeta *SnapshotMeta
+	snapshotData []byte
 }
 
 // NewMemoryStorage creates an initialized in-memory Raft storage.
@@ -31,10 +33,15 @@ func (ms *MemoryStorage) Append(entries ...LogEntry) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
+	baseIndex := ms.entries[0].Index
+
 	for _, entry := range entries {
 		lastIdx := ms.entries[len(ms.entries)-1].Index
 
 		if entry.Index <= lastIdx {
+			if entry.Index <= baseIndex {
+				return fmt.Errorf("%w: cannot overwrite compacted index %d", ErrIndexOutOfBounds, entry.Index)
+			}
 			if err := ms.truncateLocked(entry.Index); err != nil {
 				return err
 			}
@@ -58,13 +65,16 @@ func (ms *MemoryStorage) Truncate(fromIndex uint64) error {
 }
 
 func (ms *MemoryStorage) truncateLocked(fromIndex uint64) error {
-	if fromIndex == 0 {
-		return fmt.Errorf("%w: cannot truncate index 0", ErrIndexOutOfBounds)
+	baseIndex := ms.entries[0].Index
+	if fromIndex <= baseIndex {
+		return fmt.Errorf("%w: cannot truncate at or before baseline index %d", ErrIndexOutOfBounds, baseIndex)
 	}
-	if fromIndex >= uint64(len(ms.entries)) {
+	lastIdx := ms.entries[len(ms.entries)-1].Index
+	if fromIndex > lastIdx {
 		return nil
 	}
-	ms.entries = ms.entries[:fromIndex]
+	sliceIdx := fromIndex - baseIndex
+	ms.entries = ms.entries[:sliceIdx]
 	return nil
 }
 
@@ -72,10 +82,11 @@ func (ms *MemoryStorage) GetEntry(index uint64) (*LogEntry, error) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
-	if index == 0 || index >= uint64(len(ms.entries)) {
+	baseIndex := ms.entries[0].Index
+	if index <= baseIndex || index >= baseIndex+uint64(len(ms.entries)) {
 		return nil, ErrEntryNotFound
 	}
-	entry := ms.entries[index]
+	entry := ms.entries[index-baseIndex]
 	return &entry, nil
 }
 
@@ -83,12 +94,15 @@ func (ms *MemoryStorage) GetEntries(fromIndex, toIndex uint64) ([]LogEntry, erro
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
-	if fromIndex == 0 || fromIndex > toIndex || toIndex > uint64(len(ms.entries)) {
+	baseIndex := ms.entries[0].Index
+	if fromIndex <= baseIndex || fromIndex > toIndex || toIndex > baseIndex+uint64(len(ms.entries)) {
 		return nil, ErrIndexOutOfBounds
 	}
 
-	res := make([]LogEntry, toIndex-fromIndex)
-	copy(res, ms.entries[fromIndex:toIndex])
+	start := fromIndex - baseIndex
+	end := toIndex - baseIndex
+	res := make([]LogEntry, end-start)
+	copy(res, ms.entries[start:end])
 	return res, nil
 }
 
@@ -104,20 +118,22 @@ func (ms *MemoryStorage) Term(index uint64) (uint64, error) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
-	if index >= uint64(len(ms.entries)) {
+	baseIndex := ms.entries[0].Index
+	if index < baseIndex || index >= baseIndex+uint64(len(ms.entries)) {
 		return 0, ErrEntryNotFound
 	}
-	return ms.entries[index].Term, nil
+	return ms.entries[index-baseIndex].Term, nil
 }
 
 func (ms *MemoryStorage) FirstIndex() uint64 {
-	return 1
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.entries[0].Index + 1
 }
 
 func (ms *MemoryStorage) LastIndex() uint64 {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-
 	return ms.entries[len(ms.entries)-1].Index
 }
 
@@ -135,6 +151,67 @@ func (ms *MemoryStorage) GetState() (uint64, int, error) {
 	defer ms.mu.RUnlock()
 
 	return ms.currentTerm, ms.votedFor, nil
+}
+
+func (ms *MemoryStorage) SaveSnapshot(meta SnapshotMeta, data []byte) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	ms.snapshotMeta = &meta
+	ms.snapshotData = make([]byte, len(data))
+	copy(ms.snapshotData, data)
+
+	return ms.compactLocked(meta.LastIncludedIndex, meta.LastIncludedTerm)
+}
+
+func (ms *MemoryStorage) GetSnapshot() (*SnapshotMeta, []byte, error) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+
+	if ms.snapshotMeta == nil {
+		return nil, nil, nil
+	}
+	metaCopy := *ms.snapshotMeta
+	dataCopy := make([]byte, len(ms.snapshotData))
+	copy(dataCopy, ms.snapshotData)
+	return &metaCopy, dataCopy, nil
+}
+
+func (ms *MemoryStorage) Compact(compactIndex uint64) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	baseIndex := ms.entries[0].Index
+	if compactIndex <= baseIndex {
+		return nil
+	}
+	lastIdx := ms.entries[len(ms.entries)-1].Index
+	if compactIndex > lastIdx {
+		return fmt.Errorf("%w: compact index %d exceeds last log index %d", ErrIndexOutOfBounds, compactIndex, lastIdx)
+	}
+
+	compactTerm := ms.entries[compactIndex-baseIndex].Term
+	return ms.compactLocked(compactIndex, compactTerm)
+}
+
+func (ms *MemoryStorage) compactLocked(compactIndex, compactTerm uint64) error {
+	baseIndex := ms.entries[0].Index
+	if compactIndex <= baseIndex {
+		return nil
+	}
+
+	lastIdx := ms.entries[len(ms.entries)-1].Index
+	var retained []LogEntry
+	if compactIndex < lastIdx {
+		retained = ms.entries[compactIndex-baseIndex+1:]
+	}
+
+	newEntries := make([]LogEntry, 1+len(retained))
+	newEntries[0] = LogEntry{Index: compactIndex, Term: compactTerm}
+	copy(newEntries[1:], retained)
+
+	ms.entries = newEntries
+	return nil
 }
 
 func (ms *MemoryStorage) Close() error {
