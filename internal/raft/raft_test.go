@@ -259,6 +259,94 @@ func TestPureRaftProposalAndReplication(t *testing.T) {
 	r1.Advance()
 }
 
+// TestPureRaftReadIndex verifies that ReadIndex requests require a quorum round of heartbeats
+// and yield confirmed ReadStates in the pure state machine with zero disk or log writes.
+func TestPureRaftReadIndex(t *testing.T) {
+	r1 := NewRaft(Config{ID: 1, Peers: []int{2, 3}})
+	r2 := NewRaft(Config{ID: 2, Peers: []int{1, 3}})
+
+	// Elect Node 1 as leader and commit initial no-op entry
+	_ = r1.Step(Message{Type: MsgHup, From: 1})
+	_ = r1.Step(Message{Type: MsgVoteResp, From: 2, To: 1, Term: 1, Reject: false})
+	rd := r1.Ready()
+	for _, m := range rd.Messages {
+		if m.To == 2 {
+			_ = r2.Step(m)
+			rd2 := r2.Ready()
+			r2.Advance()
+			for _, resp := range rd2.Messages {
+				_ = r1.Step(resp)
+			}
+		}
+	}
+	r1.Advance()
+
+	// Submit ReadIndex request on Leader
+	ctx := []byte("client-read-ctx-1")
+	err := r1.Step(Message{
+		Type:    MsgReadIndex,
+		From:    1,
+		Entries: []storage.LogEntry{{Data: ctx}},
+	})
+	if err != nil {
+		t.Fatalf("Step MsgReadIndex failed: %v", err)
+	}
+
+	// Leader must NOT produce unstable log entries, but MUST broadcast heartbeats to confirm leadership
+	rdRead := r1.Ready()
+	if len(rdRead.Entries) != 0 {
+		t.Fatalf("ReadIndex must NOT append entries to log, got %d", len(rdRead.Entries))
+	}
+	if len(rdRead.ReadStates) != 0 {
+		t.Fatalf("ReadStates must NOT be yielded before quorum confirmation")
+	}
+
+	var heartbeatForPeer2 Message
+	for _, m := range rdRead.Messages {
+		if m.To == 2 {
+			heartbeatForPeer2 = m
+			break
+		}
+	}
+	if heartbeatForPeer2.Type != MsgApp {
+		t.Fatalf("expected MsgApp heartbeat to peer 2, got %v", heartbeatForPeer2.Type)
+	}
+	r1.Advance()
+
+	// Peer 2 receives heartbeat and sends ack MsgAppResp back to leader
+	_ = r2.Step(heartbeatForPeer2)
+	rd2 := r2.Ready()
+	r2.Advance()
+
+	var ackFromPeer2 Message
+	for _, m := range rd2.Messages {
+		if m.To == 1 && m.Type == MsgAppResp {
+			ackFromPeer2 = m
+			break
+		}
+	}
+
+	// Leader steps the heartbeat ACK -> Quorum confirmation reached!
+	err = r1.Step(ackFromPeer2)
+	if err != nil {
+		t.Fatalf("step ack failed: %v", err)
+	}
+
+	// Leader Ready batch must now contain confirmed ReadState!
+	rdConfirmed := r1.Ready()
+	if len(rdConfirmed.ReadStates) != 1 {
+		t.Fatalf("expected 1 confirmed ReadState, got %d", len(rdConfirmed.ReadStates))
+	}
+	rs := rdConfirmed.ReadStates[0]
+	if string(rs.RequestCtx) != string(ctx) {
+		t.Fatalf("read context mismatch: %s", string(rs.RequestCtx))
+	}
+	if rs.Index != r1.CommitIndex() {
+		t.Fatalf("read index %d does not match commitIndex %d", rs.Index, r1.CommitIndex())
+	}
+	r1.Advance()
+}
+
 // TestPureRaftCompaction verifies log prefix compaction and snapshot sentinel indexing.
 func TestPureRaftCompaction(t *testing.T) {
 	r := NewRaft(Config{

@@ -89,9 +89,28 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 			http.Error(w, `{"error":"key required"}`, http.StatusBadRequest)
 			return
 		}
-		item, err := rs.Get(key)
+
+		stale := r.URL.Query().Get("stale") == "true" || r.URL.Query().Get("consistent") == "false"
+		var item state.Item
+		var err error
+
+		if stale {
+			// Direct local in-memory read (eventual consistency)
+			item, err = rs.Get(key)
+		} else {
+			// Strictly linearizable read via Raft §8 ReadIndex protocol
+			item, err = rs.LinearizableGet(key)
+		}
+
 		if err != nil {
-			if errors.Is(err, state.ErrKeyNotFound) {
+			if errors.Is(err, raft.ErrNotLeader) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":     "not leader",
+					"leader_id": rs.Leader(),
+				})
+			} else if errors.Is(err, state.ErrKeyNotFound) {
 				http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)

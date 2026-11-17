@@ -23,6 +23,22 @@ type proposalResult struct {
 	err  error
 }
 
+type readIndexResponse struct {
+	readIndex uint64
+	err       error
+}
+
+type readWaitReq struct {
+	readIndex uint64
+	key       string
+	ch        chan readResult
+}
+
+type readResult struct {
+	item state.Item
+	err  error
+}
+
 // ServerConfig configures the Raft cluster node runner.
 type ServerConfig struct {
 	ID                int
@@ -58,6 +74,14 @@ type RaftServer struct {
 	pendingSnaps map[int]chan transport.InstallSnapshotReply
 	proposals    map[string]chan proposalResult
 	reqSeq       uint64
+
+	// ReadIndex tracking for linearizable reads (Raft §8, Ongaro §6.4)
+	pendingReads map[string]chan readIndexResponse
+	waitingReads []*readWaitReq
+	readSeq      uint64
+
+	// Dedicated FIFO worker queues per peer for in-order RPC delivery
+	peerChans map[int]chan Message
 
 	// Throttle logging for periodic heartbeats
 	lastHeartbeatLog time.Time
@@ -144,7 +168,16 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		pendingApps:       make(map[int]chan transport.AppendEntriesReply),
 		pendingSnaps:      make(map[int]chan transport.InstallSnapshotReply),
 		proposals:         make(map[string]chan proposalResult),
+		pendingReads:      make(map[string]chan readIndexResponse),
+		peerChans:         make(map[int]chan Message),
 		stopCh:            make(chan struct{}),
+	}
+
+	for pid, paddr := range cfg.Peers {
+		ch := make(chan Message, 8192)
+		s.peerChans[pid] = ch
+		s.wg.Add(1)
+		go s.peerSender(pid, paddr, ch)
 	}
 
 	s.wg.Add(1)
@@ -171,12 +204,20 @@ func (s *RaftServer) run() {
 			// Handle role transitions
 			if rd.SoftState != nil {
 				if rd.SoftState.Role != state.Leader {
-					// Drop waiting proposals if node lost leadership
+					// Drop waiting proposals and reads if node lost leadership
 					s.mu.Lock()
 					for k, ch := range s.proposals {
 						delete(s.proposals, k)
 						ch <- proposalResult{err: ErrNotLeader}
 					}
+					for k, ch := range s.pendingReads {
+						delete(s.pendingReads, k)
+						ch <- readIndexResponse{err: ErrNotLeader}
+					}
+					for _, req := range s.waitingReads {
+						req.ch <- readResult{err: ErrNotLeader}
+					}
+					s.waitingReads = nil
 					s.mu.Unlock()
 				}
 
@@ -250,6 +291,13 @@ func (s *RaftServer) run() {
 			}
 
 			// 4. Apply committed entries to linearizable KV state machine (Raft §5.3, §8)
+			type appliedNotif struct {
+				reqKey string
+				item   state.Item
+				err    error
+			}
+			var toNotify []appliedNotif
+
 			for _, entry := range rd.CommittedEntries {
 				if len(entry.Data) > 0 {
 					item, applyErr := s.kv.Apply(entry.Data)
@@ -258,31 +306,64 @@ func (s *RaftServer) run() {
 					var cmd state.Command
 					if err := json.Unmarshal(entry.Data, &cmd); err == nil && cmd.ClientID != "" {
 						reqKey := fmt.Sprintf("%s:%d", cmd.ClientID, cmd.SequenceNum)
-						s.mu.Lock()
-						if ch, ok := s.proposals[reqKey]; ok {
-							delete(s.proposals, reqKey)
-							ch <- proposalResult{item: item, err: applyErr}
-						}
-						s.mu.Unlock()
+						toNotify = append(toNotify, appliedNotif{reqKey: reqKey, item: item, err: applyErr})
 					}
 				} else {
 					atomic.StoreUint64(&s.lastApplied, entry.Index)
 				}
 			}
 
-			// 5. Automatic Log Compaction check (Raft §7)
+			if len(toNotify) > 0 {
+				s.mu.Lock()
+				for _, notif := range toNotify {
+					if ch, ok := s.proposals[notif.reqKey]; ok {
+						delete(s.proposals, notif.reqKey)
+						ch <- proposalResult{item: notif.item, err: notif.err}
+					}
+				}
+				s.mu.Unlock()
+			}
+
+			// 5. Process confirmed ReadIndex responses (Raft §8, Ongaro §6.4)
+			if len(rd.ReadStates) > 0 {
+				s.mu.Lock()
+				for _, rs := range rd.ReadStates {
+					reqKey := string(rs.RequestCtx)
+					if ch, ok := s.pendingReads[reqKey]; ok {
+						delete(s.pendingReads, reqKey)
+						ch <- readIndexResponse{readIndex: rs.Index}
+					}
+				}
+				s.mu.Unlock()
+			}
+
+			// 6. Unblock waiting reads that reached their readIndex
 			curApplied := atomic.LoadUint64(&s.lastApplied)
+			s.mu.Lock()
+			var remainingReads []*readWaitReq
+			for _, req := range s.waitingReads {
+				if req.readIndex <= curApplied {
+					item, err := s.kv.Get(req.key)
+					req.ch <- readResult{item: item, err: err}
+				} else {
+					remainingReads = append(remainingReads, req)
+				}
+			}
+			s.waitingReads = remainingReads
+			s.mu.Unlock()
+
+			// 7. Automatic Log Compaction check (Raft §7)
 			curSnap := atomic.LoadUint64(&s.lastSnapshotIndex)
 			if s.snapshotThreshold > 0 && (curApplied-curSnap) >= s.snapshotThreshold {
 				_ = s.maybeCompact()
 			}
 
-			// 6. Process outbound network messages
+			// 8. Process outbound network messages
 			for _, msg := range rd.Messages {
 				s.handleOutboundMessage(msg)
 			}
 
-			// 7. Advance state machine to release processed Ready batch
+			// 9. Advance state machine to release processed Ready batch
 			s.node.Advance()
 		}
 	}
@@ -361,92 +442,121 @@ func (s *RaftServer) handleOutboundMessage(msg Message) {
 	}
 	s.mu.Unlock()
 
-	// Otherwise, message is an outgoing RPC to a peer
-	peerAddr, ok := s.peers[msg.To]
-	if !ok {
-		return
-	}
-
-	s.wg.Add(1)
-	go func(m Message, addr string) {
-		defer s.wg.Done()
-
-		switch m.Type {
-		case MsgVote:
-			args := transport.RequestVoteArgs{
-				Term:         m.Term,
-				CandidateId:  m.From,
-				LastLogIndex: m.Index,
-				LastLogTerm:  m.LogTerm,
-			}
-			var reply transport.RequestVoteReply
-			if err := s.transport.RequestVote(addr, &args, &reply); err == nil {
-				if reply.VoteGranted {
-					slog.Info("received vote",
-						slog.Int("node_id", s.id),
-						slog.Int("from_peer", m.To),
-						slog.Uint64("term", reply.Term),
-					)
-				} else {
-					slog.Debug("peer rejected vote",
-						slog.Int("node_id", s.id),
-						slog.Int("from_peer", m.To),
-						slog.Uint64("term", m.Term),
-						slog.Uint64("peer_term", reply.Term),
-					)
-				}
-				_ = s.node.Step(Message{
-					Type:   MsgVoteResp,
-					From:   m.To,
-					To:     m.From,
-					Term:   reply.Term,
-					Reject: !reply.VoteGranted,
-				})
-			}
-
-		case MsgApp:
-			args := transport.AppendEntriesArgs{
-				Term:         m.Term,
-				LeaderId:     m.From,
-				PrevLogIndex: m.Index,
-				PrevLogTerm:  m.LogTerm,
-				Entries:      m.Entries,
-				LeaderCommit: m.Commit,
-			}
-			var reply transport.AppendEntriesReply
-			if err := s.transport.AppendEntries(addr, &args, &reply); err == nil {
-				_ = s.node.Step(Message{
-					Type:   MsgAppResp,
-					From:   m.To,
-					To:     m.From,
-					Term:   reply.Term,
-					Reject: !reply.Success,
-					Index:  reply.MatchIndex,
-				})
-			}
-
-		case MsgSnap:
-			if m.Snapshot == nil {
-				return
-			}
-			args := transport.InstallSnapshotArgs{
-				Term:              m.Term,
-				LeaderId:          m.From,
-				LastIncludedIndex: m.Snapshot.Metadata.LastIncludedIndex,
-				LastIncludedTerm:  m.Snapshot.Metadata.LastIncludedTerm,
-				Data:              m.Snapshot.Data,
-			}
-			var reply transport.InstallSnapshotReply
-			if err := s.transport.InstallSnapshot(addr, &args, &reply); err == nil {
-				_ = s.node.Step(Message{
-					Type: MsgSnapResp,
-					From: m.To,
-					To:   m.From,
-					Term: reply.Term,
-				})
-			}
+	// Outgoing RPC to peer delivered through dedicated FIFO worker queue
+	if ch, ok := s.peerChans[msg.To]; ok {
+		select {
+		case ch <- msg:
+		default:
+			// Queue full or peer backlogged, drop to prevent blocking the Ready loop
 		}
-	}(msg, peerAddr)
+	}
+}
+
+func (s *RaftServer) peerSender(peerID int, addr string, ch chan Message) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case m := <-ch:
+			// Coalesce queued MsgApp messages to avoid network backpressure under high throughput
+			if m.Type == MsgApp {
+				coalescing := true
+				for coalescing {
+					select {
+					case nextM := <-ch:
+						if nextM.Type == MsgApp {
+							m = nextM
+						} else {
+							s.sendRPC(m, addr)
+							m = nextM
+						}
+					default:
+						coalescing = false
+					}
+				}
+			}
+			s.sendRPC(m, addr)
+		}
+	}
+}
+
+func (s *RaftServer) sendRPC(m Message, addr string) {
+	switch m.Type {
+	case MsgVote:
+		args := transport.RequestVoteArgs{
+			Term:         m.Term,
+			CandidateId:  m.From,
+			LastLogIndex: m.Index,
+			LastLogTerm:  m.LogTerm,
+		}
+		var reply transport.RequestVoteReply
+		if err := s.transport.RequestVote(addr, &args, &reply); err == nil {
+			if reply.VoteGranted {
+				slog.Info("received vote",
+					slog.Int("node_id", s.id),
+					slog.Int("from_peer", m.To),
+					slog.Uint64("term", reply.Term),
+				)
+			} else {
+				slog.Debug("peer rejected vote",
+					slog.Int("node_id", s.id),
+					slog.Int("from_peer", m.To),
+					slog.Uint64("term", m.Term),
+					slog.Uint64("peer_term", reply.Term),
+				)
+			}
+			_ = s.node.Step(Message{
+				Type:   MsgVoteResp,
+				From:   m.To,
+				To:     m.From,
+				Term:   reply.Term,
+				Reject: !reply.VoteGranted,
+			})
+		}
+
+	case MsgApp:
+		args := transport.AppendEntriesArgs{
+			Term:         m.Term,
+			LeaderId:     m.From,
+			PrevLogIndex: m.Index,
+			PrevLogTerm:  m.LogTerm,
+			Entries:      m.Entries,
+			LeaderCommit: m.Commit,
+		}
+		var reply transport.AppendEntriesReply
+		if err := s.transport.AppendEntries(addr, &args, &reply); err == nil {
+			_ = s.node.Step(Message{
+				Type:   MsgAppResp,
+				From:   m.To,
+				To:     m.From,
+				Term:   reply.Term,
+				Reject: !reply.Success,
+				Index:  reply.MatchIndex,
+			})
+		}
+
+	case MsgSnap:
+		if m.Snapshot == nil {
+			return
+		}
+		args := transport.InstallSnapshotArgs{
+			Term:              m.Term,
+			LeaderId:          m.From,
+			LastIncludedIndex: m.Snapshot.Metadata.LastIncludedIndex,
+			LastIncludedTerm:  m.Snapshot.Metadata.LastIncludedTerm,
+			Data:              m.Snapshot.Data,
+		}
+		var reply transport.InstallSnapshotReply
+		if err := s.transport.InstallSnapshot(addr, &args, &reply); err == nil {
+			_ = s.node.Step(Message{
+				Type: MsgSnapResp,
+				From: m.To,
+				To:   m.From,
+				Term: reply.Term,
+			})
+		}
+	}
 }
 
 // RequestVote handles an incoming RequestVote RPC from network transport.
@@ -626,8 +736,8 @@ func (s *RaftServer) ProposeWithTimeout(cmd state.Command, timeout time.Duration
 	s.mu.Lock()
 	if cmd.ClientID == "" {
 		s.reqSeq++
-		cmd.ClientID = fmt.Sprintf("node-%d", s.id)
-		cmd.SequenceNum = s.reqSeq
+		cmd.ClientID = fmt.Sprintf("anon-%d-%d", s.id, s.reqSeq)
+		cmd.SequenceNum = 1
 	}
 	reqKey := fmt.Sprintf("%s:%d", cmd.ClientID, cmd.SequenceNum)
 	ch := make(chan proposalResult, 1)
@@ -677,9 +787,80 @@ func (s *RaftServer) Get(key string) (state.Item, error) {
 	return s.kv.Get(key)
 }
 
-// LinearizableGet passes a read through Raft consensus for strict linearizability.
+// LinearizableGet executes a strictly linearizable read using the Raft §8 ReadIndex protocol.
+// It confirms leadership with a quorum of peers without writing to disk or appending to the log,
+// waits until preceding writes are applied to the state machine, and returns the current value.
 func (s *RaftServer) LinearizableGet(key string) (state.Item, error) {
-	return s.Propose(state.Command{Op: state.OpGet, Key: key})
+	return s.LinearizableGetWithTimeout(key, 3*time.Second)
+}
+
+// LinearizableGetWithTimeout executes a linearizable read with a caller-provided timeout.
+func (s *RaftServer) LinearizableGetWithTimeout(key string, timeout time.Duration) (state.Item, error) {
+	if s.Role() != state.Leader {
+		return state.Item{}, ErrNotLeader
+	}
+
+	s.mu.Lock()
+	s.readSeq++
+	reqKey := fmt.Sprintf("read-%d-%d", s.id, s.readSeq)
+	readIndexCh := make(chan readIndexResponse, 1)
+	s.pendingReads[reqKey] = readIndexCh
+	s.mu.Unlock()
+
+	// 1. Submit ReadIndex request to consensus state machine
+	if err := s.node.ReadIndex([]byte(reqKey)); err != nil {
+		s.mu.Lock()
+		delete(s.pendingReads, reqKey)
+		s.mu.Unlock()
+		return state.Item{}, err
+	}
+
+	var readIndex uint64
+	select {
+	case res := <-readIndexCh:
+		if res.err != nil {
+			return state.Item{}, res.err
+		}
+		readIndex = res.readIndex
+	case <-time.After(timeout):
+		s.mu.Lock()
+		delete(s.pendingReads, reqKey)
+		s.mu.Unlock()
+		return state.Item{}, ErrTimeout
+	case <-s.stopCh:
+		return state.Item{}, ErrStopped
+	}
+
+	// 2. Wait until state machine has applied all writes up to readIndex
+	curApplied := atomic.LoadUint64(&s.lastApplied)
+	if curApplied >= readIndex {
+		// Fast path: all writes up to readIndex are already applied!
+		return s.kv.Get(key)
+	}
+
+	// Slow path: register wait request until committed entries catch up
+	waitCh := make(chan readResult, 1)
+	s.mu.Lock()
+	curApplied = atomic.LoadUint64(&s.lastApplied)
+	if curApplied >= readIndex {
+		s.mu.Unlock()
+		return s.kv.Get(key)
+	}
+	s.waitingReads = append(s.waitingReads, &readWaitReq{
+		readIndex: readIndex,
+		key:       key,
+		ch:        waitCh,
+	})
+	s.mu.Unlock()
+
+	select {
+	case res := <-waitCh:
+		return res.item, res.err
+	case <-time.After(timeout):
+		return state.Item{}, ErrTimeout
+	case <-s.stopCh:
+		return state.Item{}, ErrStopped
+	}
 }
 
 // Snapshot manually forces a snapshot creation and log compaction.

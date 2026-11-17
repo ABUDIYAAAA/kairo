@@ -23,6 +23,10 @@ const (
 	MsgAppResp
 	MsgSnap
 	MsgSnapResp
+
+	// ReadIndex protocol messages (Raft §8, Ongaro §6.4)
+	MsgReadIndex
+	MsgReadIndexResp
 )
 
 func (t MessageType) String() string {
@@ -45,6 +49,10 @@ func (t MessageType) String() string {
 		return "MsgSnap"
 	case MsgSnapResp:
 		return "MsgSnapResp"
+	case MsgReadIndex:
+		return "MsgReadIndex"
+	case MsgReadIndexResp:
+		return "MsgReadIndexResp"
 	default:
 		return fmt.Sprintf("MessageType(%d)", t)
 	}
@@ -77,6 +85,12 @@ type SoftState struct {
 	Role state.Role
 }
 
+// ReadState provides point-in-time commitIndex and request context for linearizable reads (Raft §8).
+type ReadState struct {
+	Index      uint64
+	RequestCtx []byte
+}
+
 // Ready encapsulates the point-in-time entries and messages ready to be processed.
 type Ready struct {
 	SoftState *SoftState
@@ -92,6 +106,9 @@ type Ready struct {
 
 	// CommittedEntries to apply to state machine.
 	CommittedEntries []storage.LogEntry
+
+	// ReadStates yields confirmed linearizable read positions.
+	ReadStates []ReadState
 
 	// Messages to send over the network to peers.
 	Messages []Message

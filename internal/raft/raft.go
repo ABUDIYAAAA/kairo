@@ -58,6 +58,17 @@ type Raft struct {
 
 	// Tracking soft state transitions
 	lastSoftState SoftState
+
+	// ReadIndex tracking (Raft §8, Ongaro §6.4)
+	readStates       []ReadState
+	readIndexPending map[string]*readIndexTracker
+}
+
+type readIndexTracker struct {
+	index uint64
+	ctx   []byte
+	from  int
+	acks  map[int]bool
 }
 
 // Config defines the setup parameters for a pure Raft state machine.
@@ -111,6 +122,7 @@ func NewRaft(c Config) *Raft {
 		matchIndex:       make(map[int]uint64),
 		votes:            make(map[int]bool),
 		heartbeatTimeout: c.HeartbeatTimeout,
+		readIndexPending: make(map[string]*readIndexTracker),
 	}
 
 	r.resetRandomElectionTimeout(c.ElectionTimeout)
@@ -236,8 +248,18 @@ func (r *Raft) Step(m Message) error {
 			return nil
 		}
 
+		// If the entire message contains entries already compacted into our snapshot, ACK and return (§7)
+		if m.Index+uint64(len(m.Entries)) <= r.snapshotIndex {
+			r.send(Message{To: m.From, From: r.id, Type: MsgAppResp, Term: r.currentTerm, Reject: false, Index: r.lastIndex()})
+			return nil
+		}
+
 		// Append any new entries not already in the log (§5.3)
 		for _, entry := range m.Entries {
+			// Skip entries that are already part of a compacted snapshot
+			if entry.Index <= r.snapshotIndex {
+				continue
+			}
 			if entry.Index <= r.lastIndex() {
 				if r.termAt(entry.Index) != entry.Term {
 					r.truncate(entry.Index)
@@ -259,6 +281,26 @@ func (r *Raft) Step(m Message) error {
 
 	case MsgAppResp:
 		if r.role == state.Leader && m.Term == r.currentTerm {
+			// Record heartbeat ACK for ReadIndex quorum confirmation (§8, Ongaro §6.4)
+			majority := (len(r.peers)+1)/2 + 1
+			for reqKey, tracker := range r.readIndexPending {
+				tracker.acks[m.From] = true
+				if len(tracker.acks) >= majority {
+					if tracker.from == r.id {
+						r.readStates = append(r.readStates, ReadState{Index: tracker.index, RequestCtx: tracker.ctx})
+					} else {
+						r.send(Message{
+							To:      tracker.from,
+							From:    r.id,
+							Type:    MsgReadIndexResp,
+							Index:   tracker.index,
+							Entries: []storage.LogEntry{{Data: tracker.ctx}},
+						})
+					}
+					delete(r.readIndexPending, reqKey)
+				}
+			}
+
 			if m.Reject {
 				// Follower rejected, backtrack nextIndex
 				if r.nextIndex[m.From] > 1 {
@@ -273,6 +315,48 @@ func (r *Raft) Step(m Message) error {
 				// Check quorum commit (§5.3, §5.4)
 				r.maybeCommit()
 			}
+		}
+
+	case MsgReadIndex:
+		if r.role != state.Leader {
+			if r.lead != storage.NoVote {
+				r.send(Message{To: r.lead, From: m.From, Type: MsgReadIndex, Entries: m.Entries})
+			}
+			return nil
+		}
+
+		if len(m.Entries) == 0 {
+			return nil
+		}
+		reqCtx := m.Entries[0].Data
+		reqKey := string(reqCtx)
+
+		// Raft §8 / Ongaro §6.4: Leader must have committed an entry in its current term
+		// before serving read-only requests.
+		if r.termAt(r.commitIndex) != r.currentTerm {
+			return nil
+		}
+
+		if len(r.peers) == 0 {
+			if m.From == r.id {
+				r.readStates = append(r.readStates, ReadState{Index: r.commitIndex, RequestCtx: reqCtx})
+			} else {
+				r.send(Message{To: m.From, From: r.id, Type: MsgReadIndexResp, Index: r.commitIndex, Entries: m.Entries})
+			}
+			return nil
+		}
+
+		r.readIndexPending[reqKey] = &readIndexTracker{
+			index: r.commitIndex,
+			ctx:   reqCtx,
+			from:  m.From,
+			acks:  map[int]bool{r.id: true},
+		}
+		r.bcastAppend()
+
+	case MsgReadIndexResp:
+		if len(m.Entries) > 0 {
+			r.readStates = append(r.readStates, ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data})
 		}
 
 	case MsgSnap:
@@ -422,6 +506,7 @@ func (r *Raft) becomeCandidate() {
 	r.votedFor = r.id
 	r.votes = map[int]bool{r.id: true}
 	r.unstableHardState = &storage.HardState{CurrentTerm: r.currentTerm, VotedFor: r.votedFor}
+	r.readIndexPending = make(map[string]*readIndexTracker)
 	r.electionElapsed = 0
 	r.resetRandomElectionTimeout(10)
 }
@@ -432,6 +517,7 @@ func (r *Raft) becomeFollower(term uint64, lead int) {
 	r.votedFor = storage.NoVote
 	r.lead = lead
 	r.unstableHardState = &storage.HardState{CurrentTerm: r.currentTerm, VotedFor: r.votedFor}
+	r.readIndexPending = make(map[string]*readIndexTracker)
 	r.electionElapsed = 0
 	r.resetRandomElectionTimeout(10)
 }
@@ -466,6 +552,13 @@ func (r *Raft) truncate(fromIndex uint64) {
 	if sliceIdx < uint64(len(r.entries)) {
 		r.entries = r.entries[:sliceIdx]
 	}
+	var retainedUnstable []storage.LogEntry
+	for _, e := range r.unstableEntries {
+		if e.Index < fromIndex {
+			retainedUnstable = append(retainedUnstable, e)
+		}
+	}
+	r.unstableEntries = retainedUnstable
 }
 
 // CompactLog discards entries up to compactIndex (Raft §7).
@@ -490,6 +583,14 @@ func (r *Raft) CompactLog(meta storage.SnapshotMeta, data []byte) {
 	newEntries[0] = storage.LogEntry{Index: r.snapshotIndex, Term: r.snapshotTerm}
 	copy(newEntries[1:], retained)
 	r.entries = newEntries
+
+	var retainedUnstable []storage.LogEntry
+	for _, e := range r.unstableEntries {
+		if e.Index > r.snapshotIndex {
+			retainedUnstable = append(retainedUnstable, e)
+		}
+	}
+	r.unstableEntries = retainedUnstable
 }
 
 func (r *Raft) send(m Message) {
@@ -541,7 +642,7 @@ func (r *Raft) newCommittedEntries() []storage.LogEntry {
 // HasReady returns true if there is pending state, entries, snapshot, or messages.
 func (r *Raft) HasReady() bool {
 	return len(r.msgs) > 0 || r.unstableHardState != nil || len(r.unstableEntries) > 0 ||
-		r.unstableSnapshot != nil || len(r.newCommittedEntries()) > 0 || r.softStateChanged()
+		r.unstableSnapshot != nil || len(r.newCommittedEntries()) > 0 || len(r.readStates) > 0 || r.softStateChanged()
 }
 
 // Ready creates the point-in-time Ready batch.
@@ -551,6 +652,7 @@ func (r *Raft) Ready() Ready {
 		Entries:          r.unstableEntries,
 		Snapshot:         r.unstableSnapshot,
 		CommittedEntries: r.newCommittedEntries(),
+		ReadStates:       r.readStates,
 		Messages:         r.msgs,
 	}
 	if r.softStateChanged() {
@@ -565,6 +667,7 @@ func (r *Raft) Advance() {
 	r.unstableHardState = nil
 	r.unstableEntries = nil
 	r.unstableSnapshot = nil
+	r.readStates = nil
 	r.msgs = nil
 	r.lastApplied = r.commitIndex
 }

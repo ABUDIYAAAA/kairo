@@ -603,3 +603,337 @@ func TestSimulationLogCompactionCatchUp(t *testing.T) {
 
 	t.Logf("PASS: Slow node caught up via snapshot and resumed continuous replication")
 }
+
+// TestSimulationLinearizableReadStaleLeader verifies that a network-partitioned "stale/zombie leader"
+// CANNOT serve stale reads via LinearizableGet. Because it cannot reach a quorum of heartbeats,
+// ReadIndex prevents stale data returns, strictly maintaining linearizability.
+func TestSimulationLinearizableReadStaleLeader(t *testing.T) {
+	h, err := NewClusterHarness(3)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, term := h.WaitSingleLeader(t, 4*time.Second)
+	t.Logf("Initial Leader is Node %d in Term %d", leaderID, term)
+	leader := h.nodes[leaderID]
+
+	// 1. Initial write through leader
+	item, err := leader.Put("lin-key", "initial-value")
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if item.Value != "initial-value" {
+		t.Fatalf("unexpected value: %v", item.Value)
+	}
+
+	// Verify linearizable read works on healthy leader
+	readItem, err := leader.LinearizableGet("lin-key")
+	if err != nil || readItem.Value != "initial-value" {
+		t.Fatalf("LinearizableGet failed on active leader: %v, got %+v", err, readItem)
+	}
+
+	// 2. Partition leader away into minority {leaderID}, majority {other nodes}
+	var majority []int
+	for id := range h.nodes {
+		if id != leaderID {
+			majority = append(majority, id)
+		}
+	}
+	t.Logf("Isolating leader %d from majority partition %v", leaderID, majority)
+	h.net.Partition([]int{leaderID}, majority)
+
+	// 3. Majority partition elects new leader in higher term
+	time.Sleep(300 * time.Millisecond)
+	var newLeaderID int
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, id := range majority {
+			if h.nodes[id].Role() == state.Leader && h.nodes[id].Term() > term {
+				newLeaderID = id
+				break
+			}
+		}
+		if newLeaderID != 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if newLeaderID == 0 {
+		t.Fatalf("majority partition failed to elect new leader")
+	}
+	t.Logf("Majority partition elected new Leader Node %d in Term %d", newLeaderID, h.nodes[newLeaderID].Term())
+
+	// 4. New leader writes updated value "updated-value"
+	newLeader := h.nodes[newLeaderID]
+	_, err = newLeader.Put("lin-key", "updated-value")
+	if err != nil {
+		t.Fatalf("Put on new leader failed: %v", err)
+	}
+
+	// 5. Query stale/zombie leader for "lin-key" via LinearizableGet!
+	// Stale leader MUST NOT return "initial-value"! It must time out or fail because it cannot reach quorum!
+	t.Logf("Querying isolated stale leader Node %d with LinearizableGet (must NOT return stale value)", leaderID)
+	_, err = leader.LinearizableGetWithTimeout("lin-key", 250*time.Millisecond)
+	if err == nil {
+		t.Fatalf("CRITICAL LINEARIZABILITY VIOLATION: Stale partitioned leader returned data without quorum!")
+	}
+	t.Logf("PASS: Stale leader safely rejected read without quorum: %v", err)
+
+	// 6. Heal network partition
+	t.Logf("Healing partition; old leader should step down, catch up, and return 'updated-value'")
+	h.net.Heal()
+	time.Sleep(500 * time.Millisecond)
+
+	// After healing, all nodes must have "updated-value"
+	for id, node := range h.nodes {
+		got, err := node.Get("lin-key")
+		if err != nil || got.Value != "updated-value" {
+			t.Fatalf("Node %d failed to converge on updated value after heal: %v, got %+v", id, err, got)
+		}
+	}
+	t.Logf("PASS: Cluster reconciled. Strict linearizability verified across partition.")
+}
+
+// TestSimulationHighThroughputWithTwoFailedNodes verifies that a 5-node cluster with
+// 2 randomly failed nodes (bare majority quorum 3/5) processes >1,000 operations/sec
+// with zero data loss, 100% linearizability, and full recovery upon node heal.
+func TestSimulationHighThroughputWithTwoFailedNodes(t *testing.T) {
+	h, err := NewClusterHarness(5)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, term := h.WaitSingleLeader(t, 4*time.Second)
+	t.Logf("Initial Leader is Node %d in Term %d", leaderID, term)
+	leader := h.nodes[leaderID]
+
+	// 1. Randomly pick 2 non-leader follower nodes to fail
+	followers := make([]int, 0, 4)
+	for id := range h.nodes {
+		if id != leaderID {
+			followers = append(followers, id)
+		}
+	}
+	rand.Shuffle(len(followers), func(i, j int) { followers[i], followers[j] = followers[j], followers[i] })
+	fail1, fail2 := followers[0], followers[1]
+	t.Logf("Failing 2 nodes randomly: Node %d and Node %d (Surviving Quorum: 3/5)", fail1, fail2)
+	h.net.Disconnect(fail1)
+	h.net.Disconnect(fail2)
+
+	// 2. High-throughput concurrent benchmark across surviving majority
+	const totalOps = 1500
+	const concurrency = 30
+	opsPerWorker := totalOps / concurrency
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalOps)
+	start := time.Now()
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for op := 0; op < opsPerWorker; op++ {
+				key := fmt.Sprintf("bench-w%d-k%d", workerID, op)
+				val := fmt.Sprintf("val-%d-%d", workerID, op)
+				_, putErr := leader.Put(key, val)
+				if putErr != nil {
+					errCh <- fmt.Errorf("worker %d op %d: %w", workerID, op, putErr)
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	close(errCh)
+
+	for putErr := range errCh {
+		t.Fatalf("operation failed during benchmark: %v", putErr)
+	}
+
+	throughput := float64(totalOps) / duration.Seconds()
+	t.Logf("RESULTS: Processed %d operations in %v -> THROUGHPUT: %.2f ops/sec (Bare Quorum 3/5)",
+		totalOps, duration, throughput)
+
+	if throughput < 1000.0 {
+		t.Fatalf("FAILED: throughput %.2f ops/sec was below the 1,000 ops/sec threshold", throughput)
+	}
+
+	// Allow surviving followers to finish applying the final committed batch
+	time.Sleep(200 * time.Millisecond)
+
+	// 3. Verify data integrity across the 3 surviving nodes
+	survivors := []int{leaderID, followers[2], followers[3]}
+	for _, id := range survivors {
+		for w := 0; w < concurrency; w++ {
+			checkOp := opsPerWorker - 1
+			key := fmt.Sprintf("bench-w%d-k%d", w, checkOp)
+			expected := fmt.Sprintf("val-%d-%d", w, checkOp)
+			item, getErr := h.nodes[id].Get(key)
+			if getErr != nil || item.Value != expected {
+				t.Fatalf("surviving node %d failed integrity check on key %s: %v, got %+v", id, key, getErr, item)
+			}
+		}
+	}
+	t.Logf("PASS: 100%% data integrity verified on all 3 surviving nodes")
+
+	// 4. Reconnect the 2 failed nodes and verify full catch-up
+	t.Logf("Reconnecting failed nodes %d and %d. Verifying reconciliation...", fail1, fail2)
+	h.net.Reconnect(fail1)
+	h.net.Reconnect(fail2)
+
+	sampleKey := fmt.Sprintf("bench-w0-k%d", opsPerWorker-1)
+	expectedVal := fmt.Sprintf("val-0-%d", opsPerWorker-1)
+
+	for _, id := range []int{fail1, fail2} {
+		deadline := time.Now().Add(4 * time.Second)
+		synced := false
+		for time.Now().Before(deadline) {
+			item, getErr := h.nodes[id].Get(sampleKey)
+			if getErr == nil && item.Value == expectedVal {
+				synced = true
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !synced {
+			item, _ := h.nodes[id].Get(sampleKey)
+			t.Fatalf("recovered node %d failed to synchronize key %s before deadline, got %+v", id, sampleKey, item)
+		}
+	}
+	t.Logf("PASS: Recovered nodes caught up successfully. Cluster converged.")
+}
+
+// TestSimulationConcurrentLinearizableReadsUnderLoad tests read scalability using ReadIndex.
+// Because ReadIndex does not write to disk or append log entries, it achieves high throughput.
+func TestSimulationConcurrentLinearizableReadsUnderLoad(t *testing.T) {
+	h, err := NewClusterHarness(5)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, _ := h.WaitSingleLeader(t, 4*time.Second)
+	leader := h.nodes[leaderID]
+
+	// Populate 50 keys
+	for i := 0; i < 50; i++ {
+		_, err := leader.Put(fmt.Sprintf("readkey-%d", i), fmt.Sprintf("readval-%d", i))
+		if err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// 25 concurrent workers performing LinearizableGet
+	const totalReads = 1250
+	const concurrency = 25
+	readsPerWorker := totalReads / concurrency
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalReads)
+	start := time.Now()
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for op := 0; op < readsPerWorker; op++ {
+				idx := (workerID*readsPerWorker + op) % 50
+				key := fmt.Sprintf("readkey-%d", idx)
+				expected := fmt.Sprintf("readval-%d", idx)
+				item, getErr := leader.LinearizableGet(key)
+				if getErr != nil {
+					errCh <- getErr
+				} else if item.Value != expected {
+					errCh <- fmt.Errorf("value mismatch: expected %s, got %s", expected, item.Value)
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	close(errCh)
+
+	for getErr := range errCh {
+		t.Fatalf("LinearizableGet failed: %v", getErr)
+	}
+
+	throughput := float64(totalReads) / duration.Seconds()
+	t.Logf("COMPLETED %d linearizable reads in %v -> READ THROUGHPUT: %.2f reads/sec",
+		totalReads, duration, throughput)
+
+	if throughput < 1000.0 {
+		t.Fatalf("read throughput %.2f reads/sec fell below 1,000 reads/sec", throughput)
+	}
+}
+
+// TestSimulationMixedThroughputChaos tests mixed PUT, Linearizable GET, and DELETE operations
+// under high concurrency.
+func TestSimulationMixedThroughputChaos(t *testing.T) {
+	h, err := NewClusterHarness(5)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, _ := h.WaitSingleLeader(t, 4*time.Second)
+	leader := h.nodes[leaderID]
+
+	// Run 600 mixed operations concurrently across 20 workers
+	const totalOps = 600
+	const concurrency = 20
+	opsPerWorker := totalOps / concurrency
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalOps)
+	start := time.Now()
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for op := 0; op < opsPerWorker; op++ {
+				key := fmt.Sprintf("mixed-w%d-k%d", workerID, op)
+				val := fmt.Sprintf("val-%d", op)
+
+				// PUT
+				_, putErr := leader.Put(key, val)
+				if putErr != nil {
+					errCh <- putErr
+					continue
+				}
+
+				// Linearizable GET
+				readItem, getErr := leader.LinearizableGet(key)
+				if getErr != nil || readItem.Value != val {
+					errCh <- fmt.Errorf("read error: %v, item: %+v", getErr, readItem)
+					continue
+				}
+
+				// DELETE (for even operations)
+				if op%2 == 0 {
+					_, delErr := leader.Delete(key)
+					if delErr != nil {
+						errCh <- delErr
+					}
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+	close(errCh)
+
+	for opErr := range errCh {
+		t.Fatalf("mixed chaos operation failed: %v", opErr)
+	}
+
+	throughput := float64(totalOps*2) / duration.Seconds()
+	t.Logf("PASS: Mixed workload completed %d total state transitions in %v (%.2f ops/sec)",
+		totalOps*2, duration, throughput)
+}

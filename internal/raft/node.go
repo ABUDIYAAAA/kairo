@@ -28,8 +28,8 @@ func StartNode(c Config) *Node {
 	r := NewRaft(c)
 	n := &Node{
 		raft:   r,
-		recvC:  make(chan Message),
-		tickC:  make(chan struct{}),
+		recvC:  make(chan Message, 4096),
+		tickC:  make(chan struct{}, 128),
 		readyC: make(chan Ready),
 		advC:   make(chan struct{}),
 		stopCh: make(chan struct{}),
@@ -66,6 +66,15 @@ func (n *Node) run() {
 		case m := <-n.recvC:
 			n.mu.Lock()
 			_ = n.raft.Step(m)
+			// Opportunistic batching of queued messages to maximize throughput
+			for i := 0; i < 256; i++ {
+				select {
+				case nextM := <-n.recvC:
+					_ = n.raft.Step(nextM)
+				default:
+					i = 256
+				}
+			}
 			n.mu.Unlock()
 
 		case readyC <- rd:
@@ -184,4 +193,17 @@ func (n *Node) CompactLog(meta storage.SnapshotMeta, data []byte) {
 	n.mu.Lock()
 	n.raft.CompactLog(meta, data)
 	n.mu.Unlock()
+}
+
+// ReadIndex submits a request context to obtain a confirmed linearizable commitIndex (Raft §8).
+func (n *Node) ReadIndex(ctx []byte) error {
+	n.mu.RLock()
+	id := n.raft.ID()
+	n.mu.RUnlock()
+
+	return n.Step(Message{
+		Type:    MsgReadIndex,
+		From:    id,
+		Entries: []storage.LogEntry{{Data: ctx}},
+	})
 }
