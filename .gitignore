@@ -1,0 +1,12 @@
+# Binaries
+bin/
+
+# Node persistent data directories
+data/
+
+# Runtime logs and PIDs
+*.log
+.pids
+
+# Temporary files
+*.tmp
