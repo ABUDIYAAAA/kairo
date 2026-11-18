@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 
 	"github.com/ABUDIYAAAA/kairo/internal/state"
@@ -9,7 +11,13 @@ import (
 )
 
 var (
-	ErrNotLeader = errors.New("raft: not leader")
+	ErrNotLeader          = errors.New("raft: not leader")
+	ErrPendingConfChange  = errors.New("raft: another configuration change is already pending commit")
+	ErrNoCurrentTermEntry = errors.New("raft: leader must commit a current-term entry before proposing membership changes")
+	ErrInvalidNodeID      = errors.New("raft: invalid node ID")
+	ErrNodeExists         = errors.New("raft: node already exists in cluster")
+	ErrNodeNotFound       = errors.New("raft: node not found")
+	ErrLearnerNotCaughtUp = errors.New("raft: learner is not caught up yet")
 )
 
 // Raft is a pure, deterministic finite state machine implementing the Raft protocol.
@@ -19,8 +27,9 @@ var (
 // - ZERO disk I/O inside.
 // - ZERO mutexes inside.
 type Raft struct {
-	id    int
-	peers []int
+	id       int
+	voters   map[int]bool // Voter peers (excluding self)
+	learners map[int]bool // Learner peers (excluding self, or includes self if self is learner)
 
 	role state.Role
 	lead int
@@ -43,6 +52,10 @@ type Raft struct {
 	nextIndex  map[int]uint64
 	matchIndex map[int]uint64
 	votes      map[int]bool
+
+	// Membership configuration tracking (Ongaro §4.1 / etcd semantics)
+	pendingConfIndex uint64 // Highest uncommitted EntryConfChange index
+	removed          bool   // True if local node was removed from the cluster
 
 	// Ticks and timeouts (logical clock)
 	electionElapsed    int
@@ -75,8 +88,9 @@ type readIndexTracker struct {
 
 // Config defines the setup parameters for a pure Raft state machine.
 type Config struct {
-	ID    int
-	Peers []int
+	ID       int
+	Peers    []int // Initial voter peers (excluding self)
+	Learners []int // Initial learner peers
 
 	CurrentTerm       uint64
 	VotedFor          int
@@ -108,9 +122,21 @@ func NewRaft(c Config) *Raft {
 		entries = append([]storage.LogEntry{sentinel}, entries...)
 	}
 
+	voters := make(map[int]bool)
+	for _, p := range c.Peers {
+		if p != c.ID {
+			voters[p] = true
+		}
+	}
+	learners := make(map[int]bool)
+	for _, l := range c.Learners {
+		learners[l] = true
+	}
+
 	r := &Raft{
 		id:                 c.ID,
-		peers:              c.Peers,
+		voters:             voters,
+		learners:           learners,
 		role:               state.Follower,
 		lead:               storage.NoVote,
 		currentTerm:        c.CurrentTerm,
@@ -135,6 +161,176 @@ func NewRaft(c Config) *Raft {
 	return r
 }
 
+// Voters returns all voter IDs in the cluster (including self if self is a voter).
+func (r *Raft) Voters() []int {
+	v := make([]int, 0, len(r.voters)+1)
+	if !r.removed && !r.learners[r.id] {
+		v = append(v, r.id)
+	}
+	for id := range r.voters {
+		v = append(v, id)
+	}
+	return v
+}
+
+// VoterPeers returns all voter IDs excluding self.
+func (r *Raft) VoterPeers() []int {
+	v := make([]int, 0, len(r.voters))
+	for id := range r.voters {
+		v = append(v, id)
+	}
+	return v
+}
+
+// Learners returns all learner IDs.
+func (r *Raft) Learners() []int {
+	l := make([]int, 0, len(r.learners))
+	for id := range r.learners {
+		l = append(l, id)
+	}
+	return l
+}
+
+// AllPeers returns all peer IDs excluding self (voters + learners).
+func (r *Raft) AllPeers() []int {
+	all := make([]int, 0, len(r.voters)+len(r.learners))
+	for id := range r.voters {
+		all = append(all, id)
+	}
+	for id := range r.learners {
+		if id != r.id {
+			all = append(all, id)
+		}
+	}
+	return all
+}
+
+// ConfState returns the current cluster membership.
+func (r *Raft) ConfState() storage.ConfState {
+	return storage.ConfState{
+		Voters:   r.Voters(),
+		Learners: r.Learners(),
+	}
+}
+
+// voterQuorum calculates the majority threshold of voting members.
+func (r *Raft) voterQuorum() int {
+	totalVoters := len(r.voters)
+	if !r.removed && !r.learners[r.id] {
+		totalVoters++
+	}
+	return totalVoters/2 + 1
+}
+
+func (r *Raft) isLearner(id int) bool {
+	return r.learners[id]
+}
+
+func (r *Raft) isVoter(id int) bool {
+	if id == r.id {
+		return !r.removed && !r.learners[r.id]
+	}
+	return r.voters[id]
+}
+
+// IsLearnerCaughtUp checks whether a learner's matchIndex is within threshold of the leader's last log index.
+func (r *Raft) IsLearnerCaughtUp(id int) bool {
+	if !r.learners[id] {
+		return false
+	}
+	lastIdx := r.lastIndex()
+	if lastIdx == 0 {
+		return true
+	}
+	match := r.matchIndex[id]
+	if match == 0 {
+		return false
+	}
+	return match >= lastIdx || match+10 >= lastIdx
+}
+
+// ApplyConfChange applies a committed configuration change to the pure Raft state machine (etcd semantics).
+func (r *Raft) ApplyConfChange(cc storage.ConfChange) (storage.ConfState, error) {
+	switch cc.Type {
+	case storage.ConfAddLearner:
+		if cc.NodeID <= 0 {
+			return r.ConfState(), ErrInvalidNodeID
+		}
+		if cc.NodeID == r.id {
+			r.learners[r.id] = true
+		} else {
+			if r.voters[cc.NodeID] {
+				return r.ConfState(), ErrNodeExists
+			}
+			r.learners[cc.NodeID] = true
+			if r.role == state.Leader {
+				if _, ok := r.nextIndex[cc.NodeID]; !ok {
+					r.nextIndex[cc.NodeID] = r.lastIndex() + 1
+					r.matchIndex[cc.NodeID] = 0
+				}
+			}
+		}
+
+	case storage.ConfPromoteVoter:
+		if cc.NodeID <= 0 {
+			return r.ConfState(), ErrInvalidNodeID
+		}
+		if !r.learners[cc.NodeID] {
+			if (cc.NodeID == r.id && !r.learners[r.id]) || r.voters[cc.NodeID] {
+				return r.ConfState(), nil // already a voter
+			}
+			return r.ConfState(), ErrNodeNotFound
+		}
+		delete(r.learners, cc.NodeID)
+		if cc.NodeID == r.id {
+			// self promoted to voter
+		} else {
+			r.voters[cc.NodeID] = true
+			if r.role == state.Leader {
+				if _, ok := r.nextIndex[cc.NodeID]; !ok {
+					r.nextIndex[cc.NodeID] = r.lastIndex() + 1
+					r.matchIndex[cc.NodeID] = 0
+				}
+			}
+		}
+
+	case storage.ConfRemoveNode:
+		if cc.NodeID <= 0 {
+			return r.ConfState(), ErrInvalidNodeID
+		}
+		delete(r.learners, cc.NodeID)
+		delete(r.voters, cc.NodeID)
+		delete(r.nextIndex, cc.NodeID)
+		delete(r.matchIndex, cc.NodeID)
+
+		if r.lead == cc.NodeID {
+			r.lead = storage.NoVote
+		}
+
+		if cc.NodeID == r.id {
+			// Local node removed: mark removed and step down
+			r.removed = true
+			if r.role == state.Leader {
+				r.becomeFollower(r.currentTerm, storage.NoVote)
+			}
+			r.lead = storage.NoVote
+		}
+
+	default:
+		return r.ConfState(), fmt.Errorf("unknown conf change type: %s", cc.Type)
+	}
+
+	// Clear pendingConfIndex on committed application
+	r.pendingConfIndex = 0
+
+	// Quorum may have changed (e.g. node removed); check if new commits are possible
+	if r.role == state.Leader {
+		r.maybeCommit()
+	}
+
+	return r.ConfState(), nil
+}
+
 func (r *Raft) resetRandomElectionTimeout(base int) {
 	r.electionTimeout = base + rand.Intn(base)
 }
@@ -153,7 +349,9 @@ func (r *Raft) Tick() {
 			r.electionElapsed = 0
 			r.lead = storage.NoVote
 			r.resetRandomElectionTimeout(r.minElectionTimeout)
-			_ = r.Step(Message{From: r.id, Type: MsgHup})
+			if r.isVoter(r.id) {
+				_ = r.Step(Message{From: r.id, Type: MsgHup})
+			}
 		}
 	}
 }
@@ -173,9 +371,10 @@ func (r *Raft) Step(m Message) error {
 
 	switch m.Type {
 	case MsgHup:
-		if r.role != state.Leader {
-			r.campaign()
+		if r.role == state.Leader || !r.isVoter(r.id) {
+			return nil
 		}
+		r.campaign()
 
 	case MsgBeat:
 		if r.role == state.Leader {
@@ -189,10 +388,49 @@ func (r *Raft) Step(m Message) error {
 		}
 		if len(m.Entries) > 0 {
 			for _, entry := range m.Entries {
+				if entry.Type == storage.EntryConfChange {
+					// 1. Enforce single pending configuration change at a time (§4.1)
+					if r.pendingConfIndex > r.commitIndex {
+						return ErrPendingConfChange
+					}
+					// 2. Enforce leader current-term commit guard (§5.4.2)
+					if r.commitIndex == 0 || r.termAt(r.commitIndex) != r.currentTerm {
+						return ErrNoCurrentTermEntry
+					}
+					var cc storage.ConfChange
+					if err := json.Unmarshal(entry.Data, &cc); err != nil {
+						return err
+					}
+					if cc.NodeID <= 0 {
+						return ErrInvalidNodeID
+					}
+					switch cc.Type {
+					case storage.ConfAddLearner:
+						if cc.NodeID == r.id || r.voters[cc.NodeID] || r.learners[cc.NodeID] {
+							return ErrNodeExists
+						}
+					case storage.ConfPromoteVoter:
+						if !r.learners[cc.NodeID] {
+							return ErrNodeNotFound
+						}
+						if !r.IsLearnerCaughtUp(cc.NodeID) {
+							return ErrLearnerNotCaughtUp
+						}
+					case storage.ConfRemoveNode:
+						if cc.NodeID != r.id && !r.voters[cc.NodeID] && !r.learners[cc.NodeID] {
+							return ErrNodeNotFound
+						}
+					}
+				}
+
 				newEntry := storage.LogEntry{
 					Index: r.lastIndex() + 1,
 					Term:  r.currentTerm,
+					Type:  entry.Type,
 					Data:  entry.Data,
+				}
+				if entry.Type == storage.EntryConfChange {
+					r.pendingConfIndex = newEntry.Index
 				}
 				r.entries = append(r.entries, newEntry)
 				r.unstableEntries = append(r.unstableEntries, newEntry)
@@ -206,6 +444,12 @@ func (r *Raft) Step(m Message) error {
 		// If we are the leader, or if we have heard from a leader within minElectionTimeout,
 		// ignore/reject the vote request to preserve the active leader.
 		if r.role == state.Leader || (r.lead != storage.NoVote && r.electionElapsed < r.minElectionTimeout) {
+			r.send(Message{To: m.From, From: r.id, Type: MsgVoteResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
+		// Non-voters (learners or removed nodes) cannot vote or be voted for
+		if !r.isVoter(r.id) || !r.isVoter(m.From) {
 			r.send(Message{To: m.From, From: r.id, Type: MsgVoteResp, Term: r.currentTerm, Reject: true})
 			return nil
 		}
@@ -229,14 +473,13 @@ func (r *Raft) Step(m Message) error {
 		if r.role == state.Candidate && m.Term == r.currentTerm {
 			r.votes[m.From] = !m.Reject
 			granted := 0
-			for _, v := range r.votes {
-				if v {
+			for id, v := range r.votes {
+				if v && (id == r.id || r.voters[id]) {
 					granted++
 				}
 			}
 
-			totalNodes := len(r.peers) + 1
-			majority := totalNodes/2 + 1
+			majority := r.voterQuorum()
 			if granted >= majority {
 				r.becomeLeader()
 				r.bcastAppend()
@@ -248,6 +491,12 @@ func (r *Raft) Step(m Message) error {
 		// 1. Leader stickiness / lease check: if we are the leader or have heard from a leader
 		// within minElectionTimeout, reject speculative pre-vote.
 		if r.role == state.Leader || (r.lead != storage.NoVote && r.electionElapsed < r.minElectionTimeout) {
+			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
+		// Non-voters (learners or removed nodes) cannot participate in pre-votes
+		if !r.isVoter(r.id) || !r.isVoter(m.From) {
 			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: true})
 			return nil
 		}
@@ -280,14 +529,13 @@ func (r *Raft) Step(m Message) error {
 			}
 
 			granted := 0
-			for _, v := range r.votes {
-				if v {
+			for id, v := range r.votes {
+				if v && (id == r.id || r.voters[id]) {
 					granted++
 				}
 			}
 
-			totalNodes := len(r.peers) + 1
-			majority := totalNodes/2 + 1
+			majority := r.voterQuorum()
 			if granted >= majority {
 				// Pre-Vote won! Formally campaign in a real election (§5.2)
 				r.campaignElection()
@@ -352,10 +600,16 @@ func (r *Raft) Step(m Message) error {
 	case MsgAppResp:
 		if r.role == state.Leader && m.Term == r.currentTerm {
 			// Record heartbeat ACK for ReadIndex quorum confirmation (§8, Ongaro §6.4)
-			majority := (len(r.peers)+1)/2 + 1
+			majority := r.voterQuorum()
 			for reqKey, tracker := range r.readIndexPending {
 				tracker.acks[m.From] = true
-				if len(tracker.acks) >= majority {
+				ackCount := 0
+				for ackPeer, acked := range tracker.acks {
+					if acked && (ackPeer == r.id || r.voters[ackPeer]) {
+						ackCount++
+					}
+				}
+				if ackCount >= majority {
 					if tracker.from == r.id {
 						r.readStates = append(r.readStates, ReadState{Index: tracker.index, RequestCtx: tracker.ctx})
 					} else {
@@ -407,7 +661,7 @@ func (r *Raft) Step(m Message) error {
 			return nil
 		}
 
-		if len(r.peers) == 0 {
+		if len(r.voters) == 0 {
 			if m.From == r.id {
 				r.readStates = append(r.readStates, ReadState{Index: r.commitIndex, RequestCtx: reqCtx})
 			} else {
@@ -450,6 +704,20 @@ func (r *Raft) Step(m Message) error {
 				r.snapshotTerm = meta.LastIncludedTerm
 				r.snapshotData = m.Snapshot.Data
 
+				// Restore ConfState from snapshot if present
+				if len(meta.ConfState.Voters) > 0 || len(meta.ConfState.Learners) > 0 {
+					r.voters = make(map[int]bool)
+					r.learners = make(map[int]bool)
+					for _, v := range meta.ConfState.Voters {
+						if v != r.id {
+							r.voters[v] = true
+						}
+					}
+					for _, l := range meta.ConfState.Learners {
+						r.learners[l] = true
+					}
+				}
+
 				// Reset log with new snapshot baseline sentinel
 				r.entries = []storage.LogEntry{{Index: r.snapshotIndex, Term: r.snapshotTerm}}
 				r.commitIndex = r.snapshotIndex
@@ -477,16 +745,18 @@ func (r *Raft) Step(m Message) error {
 
 func (r *Raft) maybeCommit() {
 	// Leader commits entry N if majority of matchIndex[i] >= N and termAt(N) == currentTerm (§5.3, §5.4)
-	totalNodes := len(r.peers) + 1
-	majority := totalNodes/2 + 1
+	majority := r.voterQuorum()
 
 	for n := r.lastIndex(); n > r.commitIndex; n-- {
 		if r.termAt(n) != r.currentTerm {
 			continue
 		}
 
-		matches := 1 // self
-		for _, peer := range r.peers {
+		matches := 0
+		if !r.learners[r.id] {
+			matches = 1 // self
+		}
+		for peer := range r.voters {
 			if r.matchIndex[peer] >= n {
 				matches++
 			}
@@ -509,14 +779,18 @@ func (r *Raft) campaign() {
 }
 
 func (r *Raft) campaignPreVote() {
+	if !r.isVoter(r.id) {
+		return
+	}
 	r.becomePreCandidate()
-	if len(r.peers) == 0 {
+	voterPeers := r.VoterPeers()
+	if len(voterPeers) == 0 {
 		r.campaignElection()
 		return
 	}
 
 	lastIdx, lastTerm := r.lastLog()
-	for _, peer := range r.peers {
+	for _, peer := range voterPeers {
 		r.send(Message{
 			To:      peer,
 			From:    r.id,
@@ -529,14 +803,18 @@ func (r *Raft) campaignPreVote() {
 }
 
 func (r *Raft) campaignElection() {
+	if !r.isVoter(r.id) {
+		return
+	}
 	r.becomeCandidate()
-	if len(r.peers) == 0 {
+	voterPeers := r.VoterPeers()
+	if len(voterPeers) == 0 {
 		r.becomeLeader()
 		return
 	}
 
 	lastIdx, lastTerm := r.lastLog()
-	for _, peer := range r.peers {
+	for _, peer := range voterPeers {
 		r.send(Message{
 			To:      peer,
 			From:    r.id,
@@ -556,7 +834,7 @@ func (r *Raft) becomePreCandidate() {
 }
 
 func (r *Raft) bcastAppend() {
-	for _, peer := range r.peers {
+	for _, peer := range r.AllPeers() {
 		r.sendAppendTo(peer)
 	}
 }
@@ -579,6 +857,7 @@ func (r *Raft) sendAppendTo(peer int) {
 				Metadata: storage.SnapshotMeta{
 					LastIncludedIndex: r.snapshotIndex,
 					LastIncludedTerm:  r.snapshotTerm,
+					ConfState:         r.ConfState(),
 				},
 				Data: r.snapshotData,
 			},
@@ -632,7 +911,7 @@ func (r *Raft) becomeLeader() {
 	r.lead = r.id
 
 	lastIdx := r.lastIndex()
-	for _, peer := range r.peers {
+	for _, peer := range r.AllPeers() {
 		r.nextIndex[peer] = lastIdx + 1
 		r.matchIndex[peer] = 0
 	}
@@ -664,6 +943,9 @@ func (r *Raft) truncate(fromIndex uint64) {
 		}
 	}
 	r.unstableEntries = retainedUnstable
+	if r.pendingConfIndex >= fromIndex {
+		r.pendingConfIndex = 0
+	}
 }
 
 // CompactLog discards entries up to compactIndex (Raft §7).

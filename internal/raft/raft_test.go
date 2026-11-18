@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -706,5 +707,258 @@ func TestPureRaftPreVoteIsolatedTermDoesNotInflate(t *testing.T) {
 	}
 	if r.Role() != state.PreCandidate {
 		t.Fatalf("expected node to remain PreCandidate, got %v", r.Role())
+	}
+}
+
+// TestPureRaftConfChangeAddLearner tests adding a non-voting learner.
+// Verifies voter quorum does NOT increase, learner receives replication, but does not count toward commit quorum.
+func TestPureRaftConfChangeAddLearner(t *testing.T) {
+	// 3-node initial cluster: Voters = [1, 2, 3], Quorum = 2
+	r := NewRaft(Config{
+		ID:    1,
+		Peers: []int{2, 3},
+	})
+	r.becomeLeader()
+
+	// Commit initial no-op entry with peer 2
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: r.lastIndex()})
+	if r.commitIndex != 1 {
+		t.Fatalf("expected no-op committed at index 1, got %d", r.commitIndex)
+	}
+
+	// 1. Propose adding Node 4 as Learner
+	cc := storage.ConfChange{
+		Type:   storage.ConfAddLearner,
+		NodeID: 4,
+		Addr:   "127.0.0.1:9004",
+	}
+	ccData, _ := json.Marshal(cc)
+	err := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: ccData}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error proposing conf change: %v", err)
+	}
+
+	// Learner is NOT yet added to learners map (etcd semantics: commit time application)
+	if r.isLearner(4) {
+		t.Fatalf("node 4 should not be in learners map before commit")
+	}
+
+	// Voter quorum MUST remain 2 (3 voters)
+	if q := r.voterQuorum(); q != 2 {
+		t.Fatalf("expected voter quorum 2, got %d", q)
+	}
+
+	// 2. Commit the ConfChange entry via Peer 2 ACK
+	confIndex := r.lastIndex()
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: confIndex})
+	if r.commitIndex != confIndex {
+		t.Fatalf("expected conf change committed at index %d, got %d", confIndex, r.commitIndex)
+	}
+
+	// 3. Apply the committed ConfChange
+	confState, err := r.ApplyConfChange(cc)
+	if err != nil {
+		t.Fatalf("failed to apply conf change: %v", err)
+	}
+
+	if !r.isLearner(4) {
+		t.Fatalf("node 4 must be a learner after commit application")
+	}
+	if len(confState.Voters) != 3 || len(confState.Learners) != 1 {
+		t.Fatalf("unexpected ConfState: %+v", confState)
+	}
+	// Quorum MUST still be 2 (learners do NOT change voter quorum)
+	if q := r.voterQuorum(); q != 2 {
+		t.Fatalf("voter quorum changed after adding learner: expected 2, got %d", q)
+	}
+
+	// 4. Verify learner ACKs do NOT advance commitIndex
+	// Write a new normal proposal
+	_ = r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Data: []byte("val1")}},
+	})
+	propIndex := r.lastIndex()
+
+	// Learner 4 ACKs the entry
+	_ = r.Step(Message{Type: MsgAppResp, From: 4, Term: r.currentTerm, Index: propIndex})
+	// Only Leader (1) and Learner (4) have it -> 1 voter only -> MUST NOT COMMIT!
+	if r.commitIndex >= propIndex {
+		t.Fatalf("CRITICAL BUG: Learner ACK committed entry without voter quorum! commitIndex=%d, propIndex=%d",
+			r.commitIndex, propIndex)
+	}
+
+	// Peer 2 (Voter) ACKs -> Now 2 voters have it -> MUST COMMIT!
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: propIndex})
+	if r.commitIndex != propIndex {
+		t.Fatalf("entry should commit after voter 2 ACK: expected %d, got %d", propIndex, r.commitIndex)
+	}
+}
+
+// TestPureRaftConfChangePromoteVoter tests promoting a caught-up learner to a full voting member.
+func TestPureRaftConfChangePromoteVoter(t *testing.T) {
+	r := NewRaft(Config{
+		ID:       1,
+		Peers:    []int{2, 3},
+		Learners: []int{4},
+	})
+	r.becomeLeader()
+
+	// Establish commit in current term
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: r.lastIndex()})
+
+	// 1. Attempt to promote when learner is NOT caught up (matchIndex is 0, lastIndex is > 0)
+	cc := storage.ConfChange{
+		Type:   storage.ConfPromoteVoter,
+		NodeID: 4,
+	}
+	ccData, _ := json.Marshal(cc)
+	err := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: ccData}},
+	})
+	if !errors.Is(err, ErrLearnerNotCaughtUp) {
+		t.Fatalf("expected ErrLearnerNotCaughtUp, got %v", err)
+	}
+
+	// 2. Catch up learner 4
+	_ = r.Step(Message{Type: MsgAppResp, From: 4, Term: r.currentTerm, Index: r.lastIndex()})
+	if !r.IsLearnerCaughtUp(4) {
+		t.Fatalf("learner 4 should be caught up")
+	}
+
+	// 3. Now promote learner 4
+	err = r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: ccData}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error promoting caught up learner: %v", err)
+	}
+
+	// Commit promotion
+	promoteIdx := r.lastIndex()
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: promoteIdx})
+	if r.commitIndex != promoteIdx {
+		t.Fatalf("expected promotion committed at %d, got %d", promoteIdx, r.commitIndex)
+	}
+
+	// Apply promotion
+	confState, err := r.ApplyConfChange(cc)
+	if err != nil {
+		t.Fatalf("failed to apply promote change: %v", err)
+	}
+
+	// Now 4 is a voter! Total voters = 4 (1, 2, 3, 4).
+	// Quorum for 4 voters: 4/2 + 1 = 3!
+	if q := r.voterQuorum(); q != 3 {
+		t.Fatalf("expected new voter quorum 3, got %d", q)
+	}
+	if len(confState.Voters) != 4 || len(confState.Learners) != 0 {
+		t.Fatalf("unexpected ConfState after promotion: %+v", confState)
+	}
+}
+
+// TestPureRaftConfChangeRejectConcurrent verifies that proposing a second ConfChange
+// while the first is uncommitted strictly returns ErrPendingConfChange.
+func TestPureRaftConfChangeRejectConcurrent(t *testing.T) {
+	r := NewRaft(Config{
+		ID:    1,
+		Peers: []int{2, 3},
+	})
+	r.becomeLeader()
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: r.lastIndex()})
+
+	// First conf change
+	cc1 := storage.ConfChange{Type: storage.ConfAddLearner, NodeID: 4}
+	cc1Data, _ := json.Marshal(cc1)
+	err := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: cc1Data}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on first conf change: %v", err)
+	}
+
+	// Second conf change while first is uncommitted
+	cc2 := storage.ConfChange{Type: storage.ConfAddLearner, NodeID: 5}
+	cc2Data, _ := json.Marshal(cc2)
+	err2 := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: cc2Data}},
+	})
+	if !errors.Is(err2, ErrPendingConfChange) {
+		t.Fatalf("expected ErrPendingConfChange for overlapping proposal, got %v", err2)
+	}
+}
+
+// TestPureRaftConfChangeRejectBeforeCurrentTermCommit verifies that a new leader
+// cannot propose membership changes until it has committed an entry in its current term.
+func TestPureRaftConfChangeRejectBeforeCurrentTermCommit(t *testing.T) {
+	r := NewRaft(Config{
+		ID:    1,
+		Peers: []int{2, 3},
+	})
+	r.becomeLeader()
+	// commitIndex is 0 (no-op entry at index 1 is not yet acknowledged/committed)
+
+	cc := storage.ConfChange{Type: storage.ConfAddLearner, NodeID: 4}
+	ccData, _ := json.Marshal(cc)
+	err := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: ccData}},
+	})
+	if !errors.Is(err, ErrNoCurrentTermEntry) {
+		t.Fatalf("expected ErrNoCurrentTermEntry before committing current term entry, got %v", err)
+	}
+}
+
+// TestPureRaftConfChangeRemoveLeader verifies that when the leader is removed,
+// it gracefully steps down to follower rather than killing itself abruptly.
+func TestPureRaftConfChangeRemoveLeader(t *testing.T) {
+	r := NewRaft(Config{
+		ID:    1,
+		Peers: []int{2, 3},
+	})
+	r.becomeLeader()
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: r.lastIndex()})
+
+	// Propose removing self (Node 1)
+	cc := storage.ConfChange{Type: storage.ConfRemoveNode, NodeID: 1}
+	ccData, _ := json.Marshal(cc)
+	err := r.Step(Message{
+		Type:    MsgProp,
+		From:    1,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: ccData}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error proposing removal of leader: %v", err)
+	}
+
+	// Commit with peer 2
+	_ = r.Step(Message{Type: MsgAppResp, From: 2, Term: r.currentTerm, Index: r.lastIndex()})
+
+	// Apply removal
+	confState, err := r.ApplyConfChange(cc)
+	if err != nil {
+		t.Fatalf("failed to apply remove leader: %v", err)
+	}
+
+	// Leader must step down to follower
+	if r.Role() != state.Follower {
+		t.Fatalf("expected removed leader to step down to Follower, got %v", r.Role())
+	}
+	if len(confState.Voters) != 2 {
+		t.Fatalf("expected 2 voters remaining, got %d", len(confState.Voters))
 	}
 }

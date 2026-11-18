@@ -44,7 +44,8 @@ type readResult struct {
 type ServerConfig struct {
 	ID                int
 	Addr              string
-	Peers             map[int]string // PeerID -> Address
+	Peers             map[int]string // PeerID -> Address (Voters)
+	Learners          map[int]string // PeerID -> Address (Learners, optional)
 	Storage           storage.Storage
 	Transport         transport.Transport
 	KVStore           *state.KVStore
@@ -107,10 +108,12 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 
 	// Restore snapshot if available in storage
 	var snapIdx, snapTerm uint64
+	var snapConf storage.ConfState
 	snapMeta, snapData, err := cfg.Storage.GetSnapshot()
 	if err == nil && snapMeta != nil {
 		snapIdx = snapMeta.LastIncludedIndex
 		snapTerm = snapMeta.LastIncludedTerm
+		snapConf = snapMeta.ConfState
 		if len(snapData) > 0 {
 			if restoreErr := kv.Restore(snapData); restoreErr != nil {
 				return nil, fmt.Errorf("failed to restore snapshot into state machine: %w", restoreErr)
@@ -133,10 +136,27 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 	for pid := range cfg.Peers {
 		peerIDs = append(peerIDs, pid)
 	}
+	learnerIDs := make([]int, 0, len(cfg.Learners))
+	for lid := range cfg.Learners {
+		learnerIDs = append(learnerIDs, lid)
+	}
+	if len(snapConf.Voters) > 0 || len(snapConf.Learners) > 0 {
+		peerIDs = nil
+		for _, v := range snapConf.Voters {
+			if v != cfg.ID {
+				peerIDs = append(peerIDs, v)
+			}
+		}
+		learnerIDs = nil
+		for _, l := range snapConf.Learners {
+			learnerIDs = append(learnerIDs, l)
+		}
+	}
 
 	node := StartNode(Config{
 		ID:                cfg.ID,
 		Peers:             peerIDs,
+		Learners:          learnerIDs,
 		CurrentTerm:       term,
 		VotedFor:          votedFor,
 		Entries:           entries,
@@ -156,10 +176,18 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		threshold = 100
 	}
 
+	allPeers := make(map[int]string, len(cfg.Peers)+len(cfg.Learners))
+	for pid, paddr := range cfg.Peers {
+		allPeers[pid] = paddr
+	}
+	for lid, laddr := range cfg.Learners {
+		allPeers[lid] = laddr
+	}
+
 	s := &RaftServer{
 		id:                cfg.ID,
 		addr:              cfg.Addr,
-		peers:             cfg.Peers,
+		peers:             allPeers,
 		node:              node,
 		storage:           cfg.Storage,
 		transport:         tr,
@@ -176,7 +204,7 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		stopCh:            make(chan struct{}),
 	}
 
-	for pid, paddr := range cfg.Peers {
+	for pid, paddr := range allPeers {
 		ch := make(chan Message, 8192)
 		s.peerChans[pid] = ch
 		s.wg.Add(1)
@@ -308,7 +336,20 @@ func (s *RaftServer) run() {
 			var toNotify []appliedNotif
 
 			for _, entry := range rd.CommittedEntries {
-				if len(entry.Data) > 0 {
+				if entry.Type == storage.EntryConfChange {
+					atomic.StoreUint64(&s.lastApplied, entry.Index)
+					var cc storage.ConfChange
+					if err := json.Unmarshal(entry.Data, &cc); err == nil {
+						confState, applyErr := s.node.ApplyConfChange(cc)
+						if applyErr != nil {
+							slog.Error("failed to apply conf change", slog.Any("error", applyErr))
+						}
+						s.applyConfChangeToServer(cc, confState)
+
+						reqKey := fmt.Sprintf("conf:%d", entry.Index)
+						toNotify = append(toNotify, appliedNotif{reqKey: reqKey, err: applyErr})
+					}
+				} else if len(entry.Data) > 0 {
 					item, applyErr := s.kv.Apply(entry.Data)
 					atomic.StoreUint64(&s.lastApplied, entry.Index)
 
@@ -406,6 +447,7 @@ func (s *RaftServer) maybeCompact() error {
 	meta := storage.SnapshotMeta{
 		LastIncludedIndex: snapIndex,
 		LastIncludedTerm:  snapTerm,
+		ConfState:         s.node.ConfState(),
 	}
 
 	if err := s.storage.SaveSnapshot(meta, data); err != nil {
@@ -974,6 +1016,20 @@ func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *tra
 		reply.Status = "ok"
 		return nil
 
+	case "CONF_CHANGE":
+		if args.ConfChange == nil {
+			return errors.New("missing ConfChange in forwarded request")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.ProposeConfChange(ctx, *args.ConfChange); err != nil {
+			reply.Error = err.Error()
+			return err
+		}
+		reply.Status = "applied"
+		reply.ConfState = s.node.ConfState()
+		return nil
+
 	default:
 		return fmt.Errorf("unknown forwarded operation: %s", args.Op)
 	}
@@ -1080,6 +1136,123 @@ func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, er
 		return state.Item{}, errors.New(reply.Error)
 	}
 	return reply.Item, nil
+}
+
+func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, confState storage.ConfState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch cc.Type {
+	case storage.ConfAddLearner:
+		s.peers[cc.NodeID] = cc.Addr
+		if cc.NodeID != s.id {
+			if _, exists := s.peerChans[cc.NodeID]; !exists {
+				ch := make(chan Message, 8192)
+				s.peerChans[cc.NodeID] = ch
+				s.wg.Add(1)
+				go s.peerSender(cc.NodeID, cc.Addr, ch)
+			}
+		}
+		slog.Info("added learner to cluster", slog.Int("node_id", cc.NodeID), slog.String("addr", cc.Addr))
+
+	case storage.ConfPromoteVoter:
+		slog.Info("promoted learner to voter", slog.Int("node_id", cc.NodeID))
+
+	case storage.ConfRemoveNode:
+		if ch, exists := s.peerChans[cc.NodeID]; exists {
+			close(ch)
+			delete(s.peerChans, cc.NodeID)
+		}
+		delete(s.peers, cc.NodeID)
+
+		if cc.NodeID == s.id {
+			slog.Info("node removed from cluster", slog.Int("node_id", s.id))
+		}
+	}
+}
+
+// ProposeConfChange submits a membership change to the cluster leader and waits for its commitment.
+func (s *RaftServer) ProposeConfChange(ctx context.Context, cc storage.ConfChange) error {
+	s.mu.Lock()
+	if s.Role() != state.Leader {
+		s.mu.Unlock()
+		return ErrNotLeader
+	}
+	s.mu.Unlock()
+
+	lastIdx := s.node.LastIndex() + 1
+	reqKey := fmt.Sprintf("conf:%d", lastIdx)
+
+	ch := make(chan proposalResult, 1)
+	s.mu.Lock()
+	s.proposals[reqKey] = ch
+	s.mu.Unlock()
+
+	if err := s.node.ProposeConfChange(cc); err != nil {
+		s.mu.Lock()
+		delete(s.proposals, reqKey)
+		s.mu.Unlock()
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.proposals, reqKey)
+		s.mu.Unlock()
+		return ctx.Err()
+	case <-s.stopCh:
+		return ErrStopped
+	case res := <-ch:
+		return res.err
+	}
+}
+
+// ExecuteOrForwardConfChange executes a membership change if leader, or transparently forwards to leader if follower.
+func (s *RaftServer) ExecuteOrForwardConfChange(ctx context.Context, cc storage.ConfChange) (storage.ConfState, error) {
+	if s.Role() == state.Leader {
+		if err := s.ProposeConfChange(ctx, cc); err != nil {
+			return storage.ConfState{}, err
+		}
+		return s.node.ConfState(), nil
+	}
+
+	leaderID := s.Leader()
+	if leaderID == storage.NoVote {
+		return storage.ConfState{}, ErrNotLeader
+	}
+
+	s.mu.Lock()
+	leaderAddr, ok := s.peers[leaderID]
+	s.mu.Unlock()
+	if !ok || leaderAddr == "" {
+		return storage.ConfState{}, fmt.Errorf("leader address for node %d unknown", leaderID)
+	}
+
+	args := transport.ClientForwardArgs{
+		Op:         "CONF_CHANGE",
+		ConfChange: &cc,
+	}
+	var reply transport.ClientForwardReply
+	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
+		return storage.ConfState{}, fmt.Errorf("failed to forward conf change to leader %d: %w", leaderID, err)
+	}
+	if reply.Error != "" {
+		return storage.ConfState{}, errors.New(reply.Error)
+	}
+	return reply.ConfState, nil
+}
+
+// Members returns the active leader ID, term, current ConfState (voters and learners), and known peer addresses.
+func (s *RaftServer) Members() (int, uint64, storage.ConfState, map[int]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peersCopy := make(map[int]string, len(s.peers)+1)
+	for id, addr := range s.peers {
+		peersCopy[id] = addr
+	}
+	peersCopy[s.id] = s.addr
+	return s.Leader(), s.Term(), s.node.ConfState(), peersCopy
 }
 
 // WatcherHub returns the active WatcherHub attached to the node's state machine.

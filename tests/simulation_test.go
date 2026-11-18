@@ -274,6 +274,36 @@ func (h *ClusterHarness) RestartNode(id int) (*raft.RaftServer, error) {
 	return rs, nil
 }
 
+func (h *ClusterHarness) AddNode(id int, knownPeers map[int]string) (*raft.RaftServer, error) {
+	addr := fmt.Sprintf("node-%d.cluster.local", id)
+	store := storage.NewMemoryStorage()
+	tr := &SimulatedTransport{fromID: id, fromAddr: addr, net: h.net}
+
+	peersCopy := make(map[int]string, len(knownPeers))
+	for pid, paddr := range knownPeers {
+		peersCopy[pid] = paddr
+	}
+
+	cfg := raft.ServerConfig{
+		ID:        id,
+		Addr:      addr,
+		Peers:     peersCopy,
+		Learners:  map[int]string{id: addr},
+		Storage:   store,
+		Transport: tr,
+	}
+
+	rs, err := raft.NewRaftServer(cfg)
+	if err != nil {
+		return nil, err
+	}
+	h.nodes[id] = rs
+	h.storages[id] = store
+	h.configs[id] = cfg
+	h.net.Register(id, addr, rs)
+	return rs, nil
+}
+
 func (h *ClusterHarness) StopAll() {
 	for _, node := range h.nodes {
 		node.Stop()

@@ -53,18 +53,20 @@ type InstallSnapshotReply struct {
 
 // ClientForwardArgs wraps client operations forwarded transparently from followers to the cluster leader.
 type ClientForwardArgs struct {
-	Op       string // "PUT", "GET", "DELETE"
-	Key      string
-	Value    string
-	ClientID string
-	SeqNum   uint64
+	Op         string // "PUT", "GET", "DELETE", "CONF_CHANGE"
+	Key        string
+	Value      string
+	ClientID   string
+	SeqNum     uint64
+	ConfChange *storage.ConfChange
 }
 
 // ClientForwardReply contains the leader's response to a forwarded client operation.
 type ClientForwardReply struct {
-	Item   state.Item
-	Status string
-	Error  string
+	Item      state.Item
+	Status    string
+	Error     string
+	ConfState storage.ConfState
 }
 
 // RaftHandler defines the methods a Raft node must implement to receive RPCs.

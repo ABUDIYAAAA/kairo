@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 
@@ -206,4 +207,42 @@ func (n *Node) ReadIndex(ctx []byte) error {
 		From:    id,
 		Entries: []storage.LogEntry{{Data: ctx}},
 	})
+}
+
+// ProposeConfChange submits a configuration change entry to be replicated.
+func (n *Node) ProposeConfChange(cc storage.ConfChange) error {
+	data, err := json.Marshal(cc)
+	if err != nil {
+		return err
+	}
+	n.mu.RLock()
+	id := n.raft.ID()
+	n.mu.RUnlock()
+
+	return n.Step(Message{
+		Type:    MsgProp,
+		From:    id,
+		Entries: []storage.LogEntry{{Type: storage.EntryConfChange, Data: data}},
+	})
+}
+
+// ApplyConfChange applies a committed configuration change to the Raft state machine.
+func (n *Node) ApplyConfChange(cc storage.ConfChange) (storage.ConfState, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.raft.ApplyConfChange(cc)
+}
+
+// ConfState returns the current cluster membership configuration.
+func (n *Node) ConfState() storage.ConfState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.ConfState()
+}
+
+// IsLearnerCaughtUp checks whether a learner is ready for promotion to voter.
+func (n *Node) IsLearnerCaughtUp(id int) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.IsLearnerCaughtUp(id)
 }
