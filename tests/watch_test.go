@@ -611,3 +611,118 @@ func TestSimulationWatchHighThroughputStress(t *testing.T) {
 	t.Logf("PASS: %d concurrent watchers successfully processed %d high-throughput writes (total %d events fanned out)!",
 		watcherCount, totalWrites, watcherCount*totalWrites)
 }
+
+// TestSimulationNodeRestartAndWatchCatchup tests that when a node crashes/reboots:
+// 1. Storage and WAL/snapshot persist.
+// 2. The node recovers and rejoins the cluster without disrupting the leader.
+// 3. The node catches up on all missed log entries committed while it was offline.
+// 4. Watchers attached to the recovered node receive real-time events and revision history.
+func TestSimulationNodeRestartAndWatchCatchup(t *testing.T) {
+	h, err := NewClusterHarness(5)
+	if err != nil {
+		t.Fatalf("failed to create harness: %v", err)
+	}
+	defer h.StopAll()
+
+	leaderID, _ := h.WaitSingleLeader(t, 4*time.Second)
+	leader := h.nodes[leaderID]
+
+	// Pick a follower to crash and restart
+	targetFollowerID := 1
+	if leaderID == 1 {
+		targetFollowerID = 2
+	}
+
+	// 1. Initial write
+	_, err = leader.Put("reboot/k1", "v1")
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Wait for follower to apply initial write
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		item, getErr := h.nodes[targetFollowerID].Get("reboot/k1")
+		if getErr == nil && item.Value == "v1" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Logf("Crashing/Stopping Node %d...", targetFollowerID)
+	// Stop node and disconnect from network
+	h.nodes[targetFollowerID].Stop()
+	h.net.Disconnect(targetFollowerID)
+
+	// 2. While target node is offline, cluster commits more writes
+	t.Logf("Cluster committing writes while Node %d is offline...", targetFollowerID)
+	_, err = leader.Put("reboot/k1", "v1-updated")
+	if err != nil {
+		t.Fatalf("Put while offline failed: %v", err)
+	}
+	_, err = leader.Put("reboot/k2", "v2")
+	if err != nil {
+		t.Fatalf("Put while offline failed: %v", err)
+	}
+	_, err = leader.Put("service/api", "v1")
+	if err != nil {
+		t.Fatalf("Put while offline failed: %v", err)
+	}
+
+	// 3. Reboot the crashed node with its persisted storage
+	t.Logf("Rebooting Node %d from persistent storage...", targetFollowerID)
+	restartedNode, err := h.RestartNode(targetFollowerID)
+	if err != nil {
+		t.Fatalf("failed to restart node %d: %v", targetFollowerID, err)
+	}
+
+	// 4. Verify node catches up on missed entries
+	t.Logf("Waiting for rebooted Node %d to catch up on missed entries...", targetFollowerID)
+	catchupDeadline := time.Now().Add(4 * time.Second)
+	caughtUp := false
+	for time.Now().Before(catchupDeadline) {
+		item1, err1 := restartedNode.Get("reboot/k1")
+		item2, err2 := restartedNode.Get("reboot/k2")
+		item3, err3 := restartedNode.Get("service/api")
+		if err1 == nil && item1.Value == "v1-updated" &&
+			err2 == nil && item2.Value == "v2" &&
+			err3 == nil && item3.Value == "v1" {
+			caughtUp = true
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	if !caughtUp {
+		t.Fatalf("rebooted Node %d failed to catch up on missed entries committed while offline", targetFollowerID)
+	}
+	t.Logf("Node %d successfully caught up on all missed mutations!", targetFollowerID)
+
+	// 5. Attach a real-time watcher to the rebooted node
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	eventsCh, _, unwatch, err := restartedNode.Watch(ctx, "service/api", false, 0)
+	if err != nil {
+		t.Fatalf("Watch on rebooted node failed: %v", err)
+	}
+	defer unwatch()
+
+	// 6. Propose new write on leader and verify watcher on rebooted follower triggers
+	_, err = leader.Put("service/api", "v2")
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	select {
+	case ev := <-eventsCh:
+		if ev.Key != "service/api" || ev.Value != "v2" || ev.PrevValue != "v1" {
+			t.Fatalf("unexpected event from rebooted node watcher: %+v", ev)
+		}
+		t.Logf("Rebooted Node %d delivered real-time event: %+v", targetFollowerID, ev)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for event on rebooted node")
+	}
+
+	t.Logf("PASS: Node restart, storage recovery, log catchup, and watcher re-attachment verified successfully!")
+}

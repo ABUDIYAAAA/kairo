@@ -198,13 +198,17 @@ func (st *SimulatedTransport) Close() error {
 
 // ClusterHarness manages a cluster of simulated RaftServer instances.
 type ClusterHarness struct {
-	net   *SimulatedNetwork
-	nodes map[int]*raft.RaftServer
+	net      *SimulatedNetwork
+	nodes    map[int]*raft.RaftServer
+	storages map[int]storage.Storage
+	configs  map[int]raft.ServerConfig
 }
 
 func NewClusterHarness(nodeCount int) (*ClusterHarness, error) {
 	net := NewSimulatedNetwork()
 	nodes := make(map[int]*raft.RaftServer)
+	storages := make(map[int]storage.Storage)
+	configs := make(map[int]raft.ServerConfig)
 
 	addrs := make(map[int]string)
 	for i := 1; i <= nodeCount; i++ {
@@ -235,13 +239,39 @@ func NewClusterHarness(nodeCount int) (*ClusterHarness, error) {
 			return nil, err
 		}
 		nodes[i] = rs
+		storages[i] = store
+		configs[i] = cfg
 		net.Register(i, addrs[i], rs)
 	}
 
 	return &ClusterHarness{
-		net:   net,
-		nodes: nodes,
+		net:      net,
+		nodes:    nodes,
+		storages: storages,
+		configs:  configs,
 	}, nil
+}
+
+func (h *ClusterHarness) RestartNode(id int) (*raft.RaftServer, error) {
+	if node, ok := h.nodes[id]; ok {
+		node.Stop()
+	}
+	h.net.Disconnect(id)
+	time.Sleep(50 * time.Millisecond)
+
+	cfg := h.configs[id]
+	tr := &SimulatedTransport{fromID: id, fromAddr: cfg.Addr, net: h.net}
+	cfg.Transport = tr
+	cfg.KVStore = state.NewKVStore()
+
+	rs, err := raft.NewRaftServer(cfg)
+	if err != nil {
+		return nil, err
+	}
+	h.nodes[id] = rs
+	h.net.Register(id, cfg.Addr, rs)
+	h.net.Reconnect(id)
+	return rs, nil
 }
 
 func (h *ClusterHarness) StopAll() {
