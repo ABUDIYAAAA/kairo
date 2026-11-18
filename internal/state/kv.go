@@ -66,6 +66,9 @@ type KVStore struct {
 
 	// Raft §8 deduplication table: ClientID -> last executed ClientResult
 	clientSessions map[string]ClientResult
+
+	// Real-time key/prefix subscription dispatcher
+	hub *WatcherHub
 }
 
 // NewKVStore creates an initialized in-memory KV store state machine.
@@ -74,7 +77,22 @@ func NewKVStore() *KVStore {
 		data:           make(map[string]Item),
 		revision:       0,
 		clientSessions: make(map[string]ClientResult),
+		hub:            NewWatcherHub(1000),
 	}
+}
+
+// SetWatcherHub configures a custom WatcherHub.
+func (s *KVStore) SetWatcherHub(hub *WatcherHub) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hub = hub
+}
+
+// WatcherHub returns the active WatcherHub attached to the state machine.
+func (s *KVStore) WatcherHub() *WatcherHub {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hub
 }
 
 // Get retrieves the current value and version metadata for a key.
@@ -102,8 +120,10 @@ func (s *KVStore) putLocked(key, value string) Item {
 	s.revision++
 
 	var newVersion uint64 = 1
+	var prevVal string
 	if existing, exists := s.data[key]; exists {
 		newVersion = existing.Version + 1
+		prevVal = existing.Value
 	}
 
 	item := Item{
@@ -113,6 +133,18 @@ func (s *KVStore) putLocked(key, value string) Item {
 	}
 
 	s.data[key] = item
+
+	if s.hub != nil {
+		s.hub.Publish(WatchEvent{
+			Type:        EventPut,
+			Key:         key,
+			Value:       value,
+			Version:     newVersion,
+			ModRevision: s.revision,
+			PrevValue:   prevVal,
+		})
+	}
+
 	return item
 }
 
@@ -170,6 +202,17 @@ func (s *KVStore) deleteLocked(key string) (Item, error) {
 	}
 
 	delete(s.data, key)
+
+	if s.hub != nil {
+		s.hub.Publish(WatchEvent{
+			Type:        EventDelete,
+			Key:         key,
+			Version:     deletedItem.Version,
+			ModRevision: s.revision,
+			PrevValue:   existing.Value,
+		})
+	}
+
 	return deletedItem, nil
 }
 

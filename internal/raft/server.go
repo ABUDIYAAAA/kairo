@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1079,6 +1080,41 @@ func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, er
 		return state.Item{}, errors.New(reply.Error)
 	}
 	return reply.Item, nil
+}
+
+// WatcherHub returns the active WatcherHub attached to the node's state machine.
+func (s *RaftServer) WatcherHub() *state.WatcherHub {
+	return s.kv.WatcherHub()
+}
+
+// Watch registers a real-time subscription for exact keys or string prefixes.
+// It returns a live event channel, any replayed historical events from sinceRev, and a cancel function.
+func (s *RaftServer) Watch(ctx context.Context, key string, prefix bool, sinceRev uint64) (<-chan state.WatchEvent, []state.WatchEvent, func(), error) {
+	hub := s.kv.WatcherHub()
+	if hub == nil {
+		return nil, nil, nil, errors.New("watcher hub not initialized")
+	}
+
+	w, replayed, err := hub.Watch(key, prefix, sinceRev)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	cancel := func() {
+		w.Close()
+	}
+
+	// Auto-cleanup on context cancellation
+	go func() {
+		select {
+		case <-ctx.Done():
+			w.Close()
+		case <-s.stopCh:
+			w.Close()
+		}
+	}()
+
+	return w.Events, replayed, cancel, nil
 }
 
 // Stop gracefully shuts down the server, node loop, and transports.

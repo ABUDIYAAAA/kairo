@@ -197,6 +197,87 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 		})
 	})
 
+	mux.HandleFunc("/watch", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, `{"error":"missing key query param"}`, http.StatusBadRequest)
+			return
+		}
+
+		prefix := r.URL.Query().Get("prefix") == "true"
+		stream := r.URL.Query().Get("stream") != "false" // default true
+
+		var sinceRev uint64
+		if sRevStr := r.URL.Query().Get("since_rev"); sRevStr != "" {
+			if parsed, err := strconv.ParseUint(sRevStr, 10, 64); err == nil {
+				sinceRev = parsed
+			}
+		}
+
+		eventsCh, replayed, cancel, err := rs.Watch(r.Context(), key, prefix, sinceRev)
+		if err != nil {
+			if errors.Is(err, state.ErrCompacted) {
+				http.Error(w, `{"error":"requested revision has been compacted"}`, http.StatusGone)
+			} else {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			}
+			return
+		}
+		defer cancel()
+
+		if !stream {
+			// One-shot mode: return first event (from replay or live) and close
+			var ev state.WatchEvent
+			if len(replayed) > 0 {
+				ev = replayed[0]
+			} else {
+				select {
+				case ev = <-eventsCh:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ev)
+			return
+		}
+
+		// Streaming mode: Server-Sent Events (SSE)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher.Flush()
+
+		// 1. Deliver replayed historical events first
+		for _, ev := range replayed {
+			data, _ := json.Marshal(ev)
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+			flusher.Flush()
+		}
+
+		// 2. Stream live events
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case ev, ok := <-eventsCh:
+				if !ok {
+					return
+				}
+				data, _ := json.Marshal(ev)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+				flusher.Flush()
+			}
+		}
+	})
+
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
