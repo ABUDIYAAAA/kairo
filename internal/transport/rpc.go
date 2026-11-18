@@ -1,6 +1,9 @@
 package transport
 
-import "github.com/ABUDIYAAAA/kairo/internal/storage"
+import (
+	"github.com/ABUDIYAAAA/kairo/internal/state"
+	"github.com/ABUDIYAAAA/kairo/internal/storage"
+)
 
 // RequestVoteArgs is the payload sent by candidates to gather votes (Raft Paper, Figure 2).
 type RequestVoteArgs struct {
@@ -8,6 +11,7 @@ type RequestVoteArgs struct {
 	CandidateId  int    // candidate requesting vote
 	LastLogIndex uint64 // index of candidate's last log entry (§5.4)
 	LastLogTerm  uint64 // term of candidate's last log entry (§5.4)
+	PreVote      bool   // true if this is a speculative Pre-Vote (Ongaro §9.6)
 }
 
 // RequestVoteReply is the response to a RequestVote RPC (Raft Paper, Figure 2).
@@ -47,11 +51,28 @@ type InstallSnapshotReply struct {
 	Term uint64 // currentTerm, for leader to update itself
 }
 
+// ClientForwardArgs wraps client operations forwarded transparently from followers to the cluster leader.
+type ClientForwardArgs struct {
+	Op       string // "PUT", "GET", "DELETE"
+	Key      string
+	Value    string
+	ClientID string
+	SeqNum   uint64
+}
+
+// ClientForwardReply contains the leader's response to a forwarded client operation.
+type ClientForwardReply struct {
+	Item   state.Item
+	Status string
+	Error  string
+}
+
 // RaftHandler defines the methods a Raft node must implement to receive RPCs.
 type RaftHandler interface {
 	RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error
 	InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
+	ClientForward(args *ClientForwardArgs, reply *ClientForwardReply) error
 }
 
 // Transport defines the client-side interface for sending RPCs to peer nodes.
@@ -59,5 +80,6 @@ type Transport interface {
 	RequestVote(addr string, args *RequestVoteArgs, reply *RequestVoteReply) error
 	AppendEntries(addr string, args *AppendEntriesArgs, reply *AppendEntriesReply) error
 	InstallSnapshot(addr string, args *InstallSnapshotArgs, reply *InstallSnapshotReply) error
+	ClientForward(addr string, args *ClientForwardArgs, reply *ClientForwardReply) error
 	Close() error
 }

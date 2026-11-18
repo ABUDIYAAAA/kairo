@@ -523,3 +523,188 @@ func TestRaftServerProposalsAndKV(t *testing.T) {
 		t.Fatalf("Snapshot failed: %v", err)
 	}
 }
+
+// TestPureRaftPreVoteSuccess tests the two-phase Pre-Vote transition:
+// PreCandidate (term unchanged) -> Candidate (term incremented) -> Leader.
+func TestPureRaftPreVoteSuccess(t *testing.T) {
+	r := NewRaft(Config{
+		ID:      1,
+		Peers:   []int{2, 3},
+		PreVote: true,
+	})
+
+	if r.Role() != state.Follower {
+		t.Fatalf("expected Follower, got %v", r.Role())
+	}
+	if r.Term() != 0 {
+		t.Fatalf("expected term 0, got %d", r.Term())
+	}
+
+	// 1. Trigger election via MsgHup -> enters PreCandidate state
+	if err := r.Step(Message{Type: MsgHup, From: 1}); err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+
+	if r.Role() != state.PreCandidate {
+		t.Fatalf("expected PreCandidate, got %v", r.Role())
+	}
+	// Critical Pre-Vote rule: Term must NOT increment during Pre-Vote phase!
+	if r.Term() != 0 {
+		t.Fatalf("expected term 0, got %d", r.Term())
+	}
+
+	// Ready batch must contain MsgPreVote messages, but ZERO HardState (zero disk writes)
+	if !r.HasReady() {
+		t.Fatalf("expected HasReady() to be true")
+	}
+	rd := r.Ready()
+	if rd.HardState != nil {
+		t.Fatalf("Pre-Vote MUST NOT write HardState to disk, got: %+v", rd.HardState)
+	}
+	if len(rd.Messages) != 2 {
+		t.Fatalf("expected 2 MsgPreVote messages, got %d", len(rd.Messages))
+	}
+	for _, m := range rd.Messages {
+		if m.Type != MsgPreVote {
+			t.Fatalf("expected MsgPreVote, got %v", m.Type)
+		}
+		if m.Term != 1 {
+			t.Fatalf("expected speculative term 1 in MsgPreVote, got %d", m.Term)
+		}
+	}
+	r.Advance()
+
+	// 2. Peer 2 grants PreVote (reaches majority: 2/3)
+	err := r.Step(Message{
+		Type:   MsgPreVoteResp,
+		From:   2,
+		To:     1,
+		Term:   0, // Peer 2's currentTerm
+		Reject: false,
+	})
+	if err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+
+	// Pre-Vote won! Must formally transition to Candidate and increment term
+	if r.Role() != state.Candidate {
+		t.Fatalf("expected Candidate after winning Pre-Vote, got %v", r.Role())
+	}
+	if r.Term() != 1 {
+		t.Fatalf("expected term 1 after becoming Candidate, got %d", r.Term())
+	}
+
+	// Ready batch must now contain HardState (persisting term=1, votedFor=1) and real MsgVote messages
+	rd = r.Ready()
+	if rd.HardState == nil || rd.HardState.CurrentTerm != 1 || rd.HardState.VotedFor != 1 {
+		t.Fatalf("unexpected hardstate: %+v", rd.HardState)
+	}
+	if len(rd.Messages) != 2 {
+		t.Fatalf("expected 2 MsgVote messages, got %d", len(rd.Messages))
+	}
+	for _, m := range rd.Messages {
+		if m.Type != MsgVote {
+			t.Fatalf("expected MsgVote, got %v", m.Type)
+		}
+	}
+	r.Advance()
+
+	// 3. Peer 2 grants real vote -> Leader elected
+	err = r.Step(Message{
+		Type:   MsgVoteResp,
+		From:   2,
+		To:     1,
+		Term:   1,
+		Reject: false,
+	})
+	if err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+
+	if r.Role() != state.Leader {
+		t.Fatalf("expected Leader, got %v", r.Role())
+	}
+}
+
+// TestPureRaftPreVoteRejectedByLeaderLease tests that a healthy follower
+// hearing from an active leader rejects speculative PreVotes from disrupted nodes.
+func TestPureRaftPreVoteRejectedByLeaderLease(t *testing.T) {
+	r := NewRaft(Config{
+		ID:      1,
+		Peers:   []int{2, 3},
+		PreVote: true,
+	})
+
+	// Follower receives heartbeat from Leader 2 in Term 1
+	err := r.Step(Message{
+		Type: MsgApp,
+		From: 2,
+		To:   1,
+		Term: 1,
+	})
+	if err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+	r.Advance()
+
+	// Node 3 (disconnected node) sends speculative MsgPreVote for Term 2
+	err = r.Step(Message{
+		Type:    MsgPreVote,
+		From:    3,
+		To:      1,
+		Term:    2,
+		Index:   0,
+		LogTerm: 0,
+	})
+	if err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+
+	// Follower must REJECT the PreVote to protect the active leader lease (Ongaro §9.6)
+	rd := r.Ready()
+	if len(rd.Messages) != 1 {
+		t.Fatalf("expected 1 response message, got %d", len(rd.Messages))
+	}
+	resp := rd.Messages[0]
+	if resp.Type != MsgPreVoteResp || !resp.Reject {
+		t.Fatalf("expected MsgPreVoteResp with Reject=true, got %+v", resp)
+	}
+
+	// Critical check: Follower's term and role MUST NOT change!
+	if r.Role() != state.Follower {
+		t.Fatalf("follower role changed: %v", r.Role())
+	}
+	if r.Term() != 1 {
+		t.Fatalf("follower term changed from 1 to %d", r.Term())
+	}
+}
+
+// TestPureRaftPreVoteIsolatedTermDoesNotInflate tests that an isolated node
+// with PreVote enabled NEVER inflates its term across repeated election timeouts.
+func TestPureRaftPreVoteIsolatedTermDoesNotInflate(t *testing.T) {
+	r := NewRaft(Config{
+		ID:              1,
+		Peers:           []int{2, 3},
+		ElectionTimeout: 10,
+		PreVote:         true,
+	})
+
+	initialTerm := r.Term() // 0
+
+	// Run 100 ticks (equivalent to ~10 election timeouts)
+	for tick := 0; tick < 100; tick++ {
+		r.Tick()
+		if r.HasReady() {
+			r.Advance()
+		}
+	}
+
+	// With PreVote enabled, because it receives no votes from peers,
+	// it never enters Candidate state and its term MUST remain 0!
+	if r.Term() != initialTerm {
+		t.Fatalf("CRITICAL BUG: Isolated node inflated term from %d to %d without winning PreVote!", initialTerm, r.Term())
+	}
+	if r.Role() != state.PreCandidate {
+		t.Fatalf("expected node to remain PreCandidate, got %v", r.Role())
+	}
+}

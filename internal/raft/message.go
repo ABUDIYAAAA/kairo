@@ -19,6 +19,8 @@ const (
 	// RPC protocol messages (Raft Paper, Figure 2 & §7)
 	MsgVote
 	MsgVoteResp
+	MsgPreVote
+	MsgPreVoteResp
 	MsgApp
 	MsgAppResp
 	MsgSnap
@@ -41,6 +43,10 @@ func (t MessageType) String() string {
 		return "MsgVote"
 	case MsgVoteResp:
 		return "MsgVoteResp"
+	case MsgPreVote:
+		return "MsgPreVote"
+	case MsgPreVoteResp:
+		return "MsgPreVoteResp"
 	case MsgApp:
 		return "MsgApp"
 	case MsgAppResp:

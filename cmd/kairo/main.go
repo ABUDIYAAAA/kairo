@@ -98,20 +98,15 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 			// Direct local in-memory read (eventual consistency)
 			item, err = rs.Get(key)
 		} else {
-			// Strictly linearizable read via Raft §8 ReadIndex protocol
-			item, err = rs.LinearizableGet(key)
+			// Strictly linearizable read via Raft §8 ReadIndex protocol (with transparent follower proxying to leader)
+			item, err = rs.ExecuteOrForwardLinearizableGet(key)
 		}
 
 		if err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTemporaryRedirect)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error":     "not leader",
-					"leader_id": rs.Leader(),
-				})
-			} else if errors.Is(err, state.ErrKeyNotFound) {
+			if errors.Is(err, state.ErrKeyNotFound) {
 				http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+			} else if errors.Is(err, raft.ErrNotLeader) {
+				http.Error(w, `{"error":"cluster has no elected leader"}`, http.StatusServiceUnavailable)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			}
@@ -139,15 +134,10 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 			http.Error(w, `{"error":"invalid JSON, key and value required"}`, http.StatusBadRequest)
 			return
 		}
-		item, err := rs.Put(req.Key, req.Value)
+		item, err := rs.ExecuteOrForwardPut(req.Key, req.Value)
 		if err != nil {
 			if errors.Is(err, raft.ErrNotLeader) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTemporaryRedirect)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error":     "not leader",
-					"leader_id": rs.Leader(),
-				})
+				http.Error(w, `{"error":"cluster has no elected leader"}`, http.StatusServiceUnavailable)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			}
@@ -175,17 +165,12 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 			http.Error(w, `{"error":"invalid JSON, key required"}`, http.StatusBadRequest)
 			return
 		}
-		item, err := rs.Delete(req.Key)
+		item, err := rs.ExecuteOrForwardDelete(req.Key)
 		if err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTemporaryRedirect)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error":     "not leader",
-					"leader_id": rs.Leader(),
-				})
-			} else if errors.Is(err, state.ErrKeyNotFound) {
+			if errors.Is(err, state.ErrKeyNotFound) {
 				http.Error(w, `{"error":"key not found"}`, http.StatusNotFound)
+			} else if errors.Is(err, raft.ErrNotLeader) {
+				http.Error(w, `{"error":"cluster has no elected leader"}`, http.StatusServiceUnavailable)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			}
@@ -234,6 +219,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "Persistent storage directory for Raft log and hard state")
 	logLevel := flag.String("log-level", "info", "Logging level: debug, info, warn, error")
 	logFormat := flag.String("log-format", "text", "Logging format: text, json")
+	preVote := flag.Bool("pre-vote", true, "Enable Pre-Vote protocol (Ongaro §9.6) to prevent election disruptions")
 
 	flag.Parse()
 
@@ -270,10 +256,11 @@ func main() {
 
 	// 3. Initialize RaftServer (coordinates I/O around pure Raft FSM via Ready batches)
 	serverCfg := raft.ServerConfig{
-		ID:      *nodeID,
-		Addr:    *addr,
-		Peers:   peers,
-		Storage: store,
+		ID:             *nodeID,
+		Addr:           *addr,
+		Peers:          peers,
+		Storage:        store,
+		DisablePreVote: !*preVote,
 	}
 
 	rServer, err := raft.NewRaftServer(serverCfg)

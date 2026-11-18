@@ -141,6 +141,11 @@ func (c *Client) InstallSnapshot(addr string, args *InstallSnapshotArgs, reply *
 	return c.call(addr, "Raft.InstallSnapshot", args, reply)
 }
 
+// ClientForward transparently proxies a client operation to the cluster leader at addr.
+func (c *Client) ClientForward(addr string, args *ClientForwardArgs, reply *ClientForwardReply) error {
+	return c.call(addr, "Raft.ClientForward", args, reply)
+}
+
 // getOrCreateClient returns an existing active RPC client or establishes a new persistent connection.
 func (c *Client) getOrCreateClient(addr string) (*rpc.Client, error) {
 	c.mu.Lock()

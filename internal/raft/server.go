@@ -48,6 +48,7 @@ type ServerConfig struct {
 	Transport         transport.Transport
 	KVStore           *state.KVStore
 	SnapshotThreshold uint64 // Number of entries before triggering compaction; 0 defaults to 100
+	DisablePreVote    bool   // If true, disables the Raft §9.6 Pre-Vote protocol (defaults to false / enabled)
 }
 
 // RaftServer coordinates I/O (disk persistence and network transport)
@@ -141,6 +142,7 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		LastIncludedIndex: snapIdx,
 		LastIncludedTerm:  snapTerm,
 		SnapshotData:      snapData,
+		PreVote:           !cfg.DisablePreVote,
 	})
 
 	tr := cfg.Transport
@@ -232,6 +234,12 @@ func (s *RaftServer) run() {
 					slog.Info("started election",
 						slog.Int("node_id", s.id),
 						slog.String("role", string(state.Candidate)),
+						slog.Uint64("term", s.node.Term()),
+					)
+				case state.PreCandidate:
+					slog.Info("started pre-vote phase",
+						slog.Int("node_id", s.id),
+						slog.String("role", string(state.PreCandidate)),
 						slog.Uint64("term", s.node.Term()),
 					)
 				case state.Follower:
@@ -418,7 +426,7 @@ func (s *RaftServer) maybeCompact() error {
 func (s *RaftServer) handleOutboundMessage(msg Message) {
 	// If message is a reply to a pending incoming RPC, unblock the RPC handler
 	s.mu.Lock()
-	if msg.Type == MsgVoteResp {
+	if msg.Type == MsgVoteResp || msg.Type == MsgPreVoteResp {
 		if ch, ok := s.pendingVotes[msg.To]; ok {
 			delete(s.pendingVotes, msg.To)
 			s.mu.Unlock()
@@ -483,17 +491,22 @@ func (s *RaftServer) peerSender(peerID int, addr string, ch chan Message) {
 
 func (s *RaftServer) sendRPC(m Message, addr string) {
 	switch m.Type {
-	case MsgVote:
+	case MsgVote, MsgPreVote:
 		args := transport.RequestVoteArgs{
 			Term:         m.Term,
 			CandidateId:  m.From,
 			LastLogIndex: m.Index,
 			LastLogTerm:  m.LogTerm,
+			PreVote:      m.Type == MsgPreVote,
 		}
 		var reply transport.RequestVoteReply
 		if err := s.transport.RequestVote(addr, &args, &reply); err == nil {
 			if reply.VoteGranted {
-				slog.Info("received vote",
+				action := "received vote"
+				if m.Type == MsgPreVote {
+					action = "received pre-vote"
+				}
+				slog.Info(action,
 					slog.Int("node_id", s.id),
 					slog.Int("from_peer", m.To),
 					slog.Uint64("term", reply.Term),
@@ -504,10 +517,15 @@ func (s *RaftServer) sendRPC(m Message, addr string) {
 					slog.Int("from_peer", m.To),
 					slog.Uint64("term", m.Term),
 					slog.Uint64("peer_term", reply.Term),
+					slog.Bool("pre_vote", m.Type == MsgPreVote),
 				)
 			}
+			respType := MsgVoteResp
+			if m.Type == MsgPreVote {
+				respType = MsgPreVoteResp
+			}
 			_ = s.node.Step(Message{
-				Type:   MsgVoteResp,
+				Type:   respType,
 				From:   m.To,
 				To:     m.From,
 				Term:   reply.Term,
@@ -567,8 +585,13 @@ func (s *RaftServer) RequestVote(args *transport.RequestVoteArgs, reply *transpo
 	s.pendingVotes[args.CandidateId] = ch
 	s.mu.Unlock()
 
+	msgType := MsgVote
+	if args.PreVote {
+		msgType = MsgPreVote
+	}
+
 	msg := Message{
-		Type:    MsgVote,
+		Type:    msgType,
 		From:    args.CandidateId,
 		To:      s.id,
 		Term:    args.Term,
@@ -587,13 +610,21 @@ func (s *RaftServer) RequestVote(args *transport.RequestVoteArgs, reply *transpo
 	case res := <-ch:
 		*reply = res
 		if res.VoteGranted {
-			slog.Info("granted vote",
+			action := "granted vote"
+			if args.PreVote {
+				action = "granted pre-vote"
+			}
+			slog.Info(action,
 				slog.Int("node_id", s.id),
 				slog.Int("candidate", args.CandidateId),
 				slog.Uint64("term", args.Term),
 			)
 		} else {
-			slog.Debug("denied vote",
+			action := "denied vote"
+			if args.PreVote {
+				action = "denied pre-vote"
+			}
+			slog.Debug(action,
 				slog.Int("node_id", s.id),
 				slog.Int("candidate", args.CandidateId),
 				slog.Uint64("candidate_term", args.Term),
@@ -891,6 +922,163 @@ func (s *RaftServer) ID() int {
 // Leader returns the ID of the current leader recognized by the node.
 func (s *RaftServer) Leader() int {
 	return s.node.Lead()
+}
+
+// ClientForward handles forwarded operations from follower nodes to the leader.
+func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *transport.ClientForwardReply) error {
+	if s.Role() != state.Leader {
+		reply.Error = ErrNotLeader.Error()
+		return ErrNotLeader
+	}
+
+	switch args.Op {
+	case "PUT":
+		item, err := s.Propose(state.Command{
+			Op:          state.OpPut,
+			Key:         args.Key,
+			Value:       args.Value,
+			ClientID:    args.ClientID,
+			SequenceNum: args.SeqNum,
+		})
+		if err != nil {
+			reply.Error = err.Error()
+			return err
+		}
+		reply.Item = item
+		reply.Status = "ok"
+		return nil
+
+	case "DELETE":
+		item, err := s.Propose(state.Command{
+			Op:          state.OpDelete,
+			Key:         args.Key,
+			ClientID:    args.ClientID,
+			SequenceNum: args.SeqNum,
+		})
+		if err != nil {
+			reply.Error = err.Error()
+			return err
+		}
+		reply.Item = item
+		reply.Status = "deleted"
+		return nil
+
+	case "GET":
+		item, err := s.LinearizableGet(args.Key)
+		if err != nil {
+			reply.Error = err.Error()
+			return err
+		}
+		reply.Item = item
+		reply.Status = "ok"
+		return nil
+
+	default:
+		return fmt.Errorf("unknown forwarded operation: %s", args.Op)
+	}
+}
+
+// ExecuteOrForwardPut executes a PUT if leader, or transparently forwards to the cluster leader if follower.
+func (s *RaftServer) ExecuteOrForwardPut(key, value string) (state.Item, error) {
+	if s.Role() == state.Leader {
+		return s.Put(key, value)
+	}
+
+	leaderID := s.Leader()
+	if leaderID == storage.NoVote {
+		return state.Item{}, ErrNotLeader
+	}
+
+	s.mu.Lock()
+	leaderAddr, ok := s.peers[leaderID]
+	s.mu.Unlock()
+	if !ok || leaderAddr == "" {
+		return state.Item{}, fmt.Errorf("leader address for node %d unknown", leaderID)
+	}
+
+	args := transport.ClientForwardArgs{
+		Op:    "PUT",
+		Key:   key,
+		Value: value,
+	}
+	var reply transport.ClientForwardReply
+	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
+		return state.Item{}, fmt.Errorf("failed to forward write to leader %d: %w", leaderID, err)
+	}
+	if reply.Error != "" {
+		return state.Item{}, errors.New(reply.Error)
+	}
+	return reply.Item, nil
+}
+
+// ExecuteOrForwardDelete executes a DELETE if leader, or transparently forwards to the cluster leader if follower.
+func (s *RaftServer) ExecuteOrForwardDelete(key string) (state.Item, error) {
+	if s.Role() == state.Leader {
+		return s.Delete(key)
+	}
+
+	leaderID := s.Leader()
+	if leaderID == storage.NoVote {
+		return state.Item{}, ErrNotLeader
+	}
+
+	s.mu.Lock()
+	leaderAddr, ok := s.peers[leaderID]
+	s.mu.Unlock()
+	if !ok || leaderAddr == "" {
+		return state.Item{}, fmt.Errorf("leader address for node %d unknown", leaderID)
+	}
+
+	args := transport.ClientForwardArgs{
+		Op:  "DELETE",
+		Key: key,
+	}
+	var reply transport.ClientForwardReply
+	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
+		return state.Item{}, fmt.Errorf("failed to forward delete to leader %d: %w", leaderID, err)
+	}
+	if reply.Error != "" {
+		if reply.Error == state.ErrKeyNotFound.Error() {
+			return state.Item{}, state.ErrKeyNotFound
+		}
+		return state.Item{}, errors.New(reply.Error)
+	}
+	return reply.Item, nil
+}
+
+// ExecuteOrForwardLinearizableGet executes a linearizable read if leader, or transparently forwards to leader if follower.
+func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, error) {
+	if s.Role() == state.Leader {
+		return s.LinearizableGet(key)
+	}
+
+	leaderID := s.Leader()
+	if leaderID == storage.NoVote {
+		return state.Item{}, ErrNotLeader
+	}
+
+	s.mu.Lock()
+	leaderAddr, ok := s.peers[leaderID]
+	s.mu.Unlock()
+	if !ok || leaderAddr == "" {
+		return state.Item{}, fmt.Errorf("leader address for node %d unknown", leaderID)
+	}
+
+	args := transport.ClientForwardArgs{
+		Op:  "GET",
+		Key: key,
+	}
+	var reply transport.ClientForwardReply
+	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
+		return state.Item{}, fmt.Errorf("failed to forward read to leader %d: %w", leaderID, err)
+	}
+	if reply.Error != "" {
+		if reply.Error == state.ErrKeyNotFound.Error() {
+			return state.Item{}, state.ErrKeyNotFound
+		}
+		return state.Item{}, errors.New(reply.Error)
+	}
+	return reply.Item, nil
 }
 
 // Stop gracefully shuts down the server, node loop, and transports.

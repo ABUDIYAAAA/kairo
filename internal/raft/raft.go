@@ -45,10 +45,12 @@ type Raft struct {
 	votes      map[int]bool
 
 	// Ticks and timeouts (logical clock)
-	electionElapsed  int
-	heartbeatElapsed int
-	electionTimeout  int
-	heartbeatTimeout int
+	electionElapsed    int
+	heartbeatElapsed   int
+	electionTimeout    int
+	minElectionTimeout int
+	heartbeatTimeout   int
+	preVote            bool
 
 	// Staging outbox for Ready batch
 	msgs              []Message
@@ -85,6 +87,7 @@ type Config struct {
 
 	ElectionTimeout  int
 	HeartbeatTimeout int
+	PreVote          bool
 }
 
 // NewRaft creates an initialized pure Raft state machine.
@@ -106,23 +109,25 @@ func NewRaft(c Config) *Raft {
 	}
 
 	r := &Raft{
-		id:               c.ID,
-		peers:            c.Peers,
-		role:             state.Follower,
-		lead:             storage.NoVote,
-		currentTerm:      c.CurrentTerm,
-		votedFor:         c.VotedFor,
-		entries:          entries,
-		snapshotIndex:    snapIdx,
-		snapshotTerm:     snapTerm,
-		snapshotData:     c.SnapshotData,
-		commitIndex:      snapIdx,
-		lastApplied:      snapIdx,
-		nextIndex:        make(map[int]uint64),
-		matchIndex:       make(map[int]uint64),
-		votes:            make(map[int]bool),
-		heartbeatTimeout: c.HeartbeatTimeout,
-		readIndexPending: make(map[string]*readIndexTracker),
+		id:                 c.ID,
+		peers:              c.Peers,
+		role:               state.Follower,
+		lead:               storage.NoVote,
+		currentTerm:        c.CurrentTerm,
+		votedFor:           c.VotedFor,
+		entries:            entries,
+		snapshotIndex:      snapIdx,
+		snapshotTerm:       snapTerm,
+		snapshotData:       c.SnapshotData,
+		commitIndex:        snapIdx,
+		lastApplied:        snapIdx,
+		nextIndex:          make(map[int]uint64),
+		matchIndex:         make(map[int]uint64),
+		votes:              make(map[int]bool),
+		minElectionTimeout: c.ElectionTimeout,
+		heartbeatTimeout:   c.HeartbeatTimeout,
+		preVote:            c.PreVote,
+		readIndexPending:   make(map[string]*readIndexTracker),
 	}
 
 	r.resetRandomElectionTimeout(c.ElectionTimeout)
@@ -146,7 +151,8 @@ func (r *Raft) Tick() {
 		r.electionElapsed++
 		if r.electionElapsed >= r.electionTimeout {
 			r.electionElapsed = 0
-			r.resetRandomElectionTimeout(10)
+			r.lead = storage.NoVote
+			r.resetRandomElectionTimeout(r.minElectionTimeout)
 			_ = r.Step(Message{From: r.id, Type: MsgHup})
 		}
 	}
@@ -155,9 +161,14 @@ func (r *Raft) Tick() {
 // Step advances the state machine by processing a message.
 func (r *Raft) Step(m Message) error {
 	// Raft §5.1: If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower
+	// set currentTerm = T, convert to follower.
+	// Exception (Ongaro Thesis §9.6): MsgPreVote does NOT cause a receiver to update currentTerm or step down.
 	if m.Term > r.currentTerm {
-		r.becomeFollower(m.Term, storage.NoVote)
+		if m.Type != MsgPreVote && m.Type != MsgPreVoteResp {
+			r.becomeFollower(m.Term, storage.NoVote)
+		} else if m.Type == MsgPreVoteResp && r.role == state.PreCandidate {
+			r.becomeFollower(m.Term, storage.NoVote)
+		}
 	}
 
 	switch m.Type {
@@ -191,6 +202,14 @@ func (r *Raft) Step(m Message) error {
 		}
 
 	case MsgVote:
+		// Leader stickiness check (Ongaro Thesis §9.6):
+		// If we are the leader, or if we have heard from a leader within minElectionTimeout,
+		// ignore/reject the vote request to preserve the active leader.
+		if r.role == state.Leader || (r.lead != storage.NoVote && r.electionElapsed < r.minElectionTimeout) {
+			r.send(Message{To: m.From, From: r.id, Type: MsgVoteResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
 		canVote := (r.votedFor == storage.NoVote || r.votedFor == m.From)
 		lastIdx, lastTerm := r.lastLog()
 		logOk := (m.LogTerm > lastTerm) || (m.LogTerm == lastTerm && m.Index >= lastIdx)
@@ -221,6 +240,57 @@ func (r *Raft) Step(m Message) error {
 			if granted >= majority {
 				r.becomeLeader()
 				r.bcastAppend()
+			}
+		}
+
+	case MsgPreVote:
+		// Pre-Vote check (Ongaro Thesis §9.6)
+		// 1. Leader stickiness / lease check: if we are the leader or have heard from a leader
+		// within minElectionTimeout, reject speculative pre-vote.
+		if r.role == state.Leader || (r.lead != storage.NoVote && r.electionElapsed < r.minElectionTimeout) {
+			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
+		// 2. Reject if candidate's speculative term is strictly less than our current term
+		if m.Term < r.currentTerm {
+			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: true})
+			return nil
+		}
+
+		// 3. Check if candidate's log is at least as up-to-date as ours (§5.4)
+		lastIdx, lastTerm := r.lastLog()
+		logOk := (m.LogTerm > lastTerm) || (m.LogTerm == lastTerm && m.Index >= lastIdx)
+
+		if logOk {
+			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: false})
+		} else {
+			r.send(Message{To: m.From, From: r.id, Type: MsgPreVoteResp, Term: r.currentTerm, Reject: true})
+		}
+
+	case MsgPreVoteResp:
+		if r.role == state.PreCandidate {
+			if m.Term > r.currentTerm {
+				r.becomeFollower(m.Term, storage.NoVote)
+				return nil
+			}
+
+			if !m.Reject {
+				r.votes[m.From] = true
+			}
+
+			granted := 0
+			for _, v := range r.votes {
+				if v {
+					granted++
+				}
+			}
+
+			totalNodes := len(r.peers) + 1
+			majority := totalNodes/2 + 1
+			if granted >= majority {
+				// Pre-Vote won! Formally campaign in a real election (§5.2)
+				r.campaignElection()
 			}
 		}
 
@@ -431,6 +501,34 @@ func (r *Raft) maybeCommit() {
 }
 
 func (r *Raft) campaign() {
+	if r.preVote {
+		r.campaignPreVote()
+	} else {
+		r.campaignElection()
+	}
+}
+
+func (r *Raft) campaignPreVote() {
+	r.becomePreCandidate()
+	if len(r.peers) == 0 {
+		r.campaignElection()
+		return
+	}
+
+	lastIdx, lastTerm := r.lastLog()
+	for _, peer := range r.peers {
+		r.send(Message{
+			To:      peer,
+			From:    r.id,
+			Type:    MsgPreVote,
+			Term:    r.currentTerm + 1,
+			LogTerm: lastTerm,
+			Index:   lastIdx,
+		})
+	}
+}
+
+func (r *Raft) campaignElection() {
 	r.becomeCandidate()
 	if len(r.peers) == 0 {
 		r.becomeLeader()
@@ -448,6 +546,13 @@ func (r *Raft) campaign() {
 			Index:   lastIdx,
 		})
 	}
+}
+
+func (r *Raft) becomePreCandidate() {
+	r.role = state.PreCandidate
+	r.votes = map[int]bool{r.id: true}
+	r.lead = storage.NoVote
+	r.electionElapsed = 0
 }
 
 func (r *Raft) bcastAppend() {
