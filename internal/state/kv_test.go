@@ -200,3 +200,54 @@ func TestKVStoreSnapshotRestore(t *testing.T) {
 		t.Fatalf("restored deduplication table failed to catch duplicate: %+v", dup)
 	}
 }
+
+func TestKVStoreCAS(t *testing.T) {
+	kv := NewKVStore()
+
+	// 1. Create with expected_version = 0 (should succeed if key doesn't exist)
+	var ver0 uint64 = 0
+	item1, err := kv.PutWithClientAndVersion("c1", 1, "test-cas", "val1", &ver0)
+	if err != nil {
+		t.Fatalf("expected success for ver0 create, got %v", err)
+	}
+	if item1.Version != 1 {
+		t.Fatalf("expected version 1, got %d", item1.Version)
+	}
+
+	// 2. Create again with expected_version = 0 (should fail with ErrVersionMismatch)
+	_, err = kv.PutWithClientAndVersion("c2", 1, "test-cas", "val2", &ver0)
+	if err != ErrVersionMismatch {
+		t.Fatalf("expected ErrVersionMismatch, got %v", err)
+	}
+
+	// 3. Mutate with wrong version (expected 2, but current is 1)
+	var ver2 uint64 = 2
+	_, err = kv.PutWithClientAndVersion("c2", 2, "test-cas", "val2", &ver2)
+	if err != ErrVersionMismatch {
+		t.Fatalf("expected ErrVersionMismatch, got %v", err)
+	}
+
+	// 4. Mutate with correct version (expected 1, current is 1)
+	var ver1 uint64 = 1
+	item2, err := kv.PutWithClientAndVersion("c2", 3, "test-cas", "val2", &ver1)
+	if err != nil {
+		t.Fatalf("expected success for ver1 mutate, got %v", err)
+	}
+	if item2.Version != 2 || item2.Value != "val2" {
+		t.Fatalf("expected version 2, got %+v", item2)
+	}
+
+	// 5. Test via Apply()
+	cmdBytes, _ := json.Marshal(Command{
+		Op:              OpPut,
+		Key:             "test-cas",
+		Value:           "val3",
+		ClientID:        "c3",
+		SequenceNum:     1,
+		ExpectedVersion: &ver1, // Stale! Current is 2
+	})
+	_, err = kv.Apply(cmdBytes)
+	if err != ErrVersionMismatch {
+		t.Fatalf("expected ErrVersionMismatch via Apply, got %v", err)
+	}
+}

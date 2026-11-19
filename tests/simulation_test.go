@@ -1129,7 +1129,7 @@ func TestSimulationFollowerTransparentProxying(t *testing.T) {
 	// 1. Client sends PUT to Follower 0
 	f0 := followers[0]
 	t.Logf("Sending PUT to Follower Node %d (leader is Node %d)...", f0.ID(), leaderID)
-	putItem, err := f0.ExecuteOrForwardPut("proxy-key1", "proxy-val1")
+	putItem, err := f0.ExecuteOrForwardPut("proxy-key1", "proxy-val1", nil)
 	if err != nil {
 		t.Fatalf("transparent proxy PUT failed: %v", err)
 	}
@@ -1183,7 +1183,7 @@ func TestSimulationFollowerTransparentProxying(t *testing.T) {
 			k := fmt.Sprintf("fanout-key-%d", opID)
 			v := fmt.Sprintf("fanout-val-%d", opID)
 
-			item, putErr := f.ExecuteOrForwardPut(k, v)
+			item, putErr := f.ExecuteOrForwardPut(k, v, nil)
 			if putErr != nil {
 				errCh <- fmt.Errorf("follower %d put error: %w", f.ID(), putErr)
 				return

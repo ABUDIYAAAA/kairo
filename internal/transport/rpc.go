@@ -53,12 +53,13 @@ type InstallSnapshotReply struct {
 
 // ClientForwardArgs wraps client operations forwarded transparently from followers to the cluster leader.
 type ClientForwardArgs struct {
-	Op         string // "PUT", "GET", "DELETE", "CONF_CHANGE"
-	Key        string
-	Value      string
-	ClientID   string
-	SeqNum     uint64
-	ConfChange *storage.ConfChange
+	Op              string // "PUT", "GET", "DELETE", "CONF_CHANGE"
+	Key             string
+	Value           string
+	ClientID        string
+	SeqNum          uint64
+	ExpectedVersion *uint64
+	ConfChange      *storage.ConfChange
 }
 
 // ClientForwardReply contains the leader's response to a forwarded client operation.

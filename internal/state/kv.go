@@ -13,6 +13,10 @@ var (
 
 	// ErrInvalidCommand indicates the command payload could not be parsed.
 	ErrInvalidCommand = errors.New("invalid command format")
+
+	// ErrVersionMismatch indicates that a conditional mutation was rejected because
+	// the key's current version does not match the expected version.
+	ErrVersionMismatch = errors.New("version mismatch")
 )
 
 // Item represents a stored value with versioning metadata.
@@ -40,11 +44,12 @@ const (
 
 // Command represents a state machine operation encoded into Raft log entries.
 type Command struct {
-	Op          OpType `json:"op"`
-	Key         string `json:"key"`
-	Value       string `json:"value,omitempty"`
-	ClientID    string `json:"client_id,omitempty"`
-	SequenceNum uint64 `json:"sequence_num,omitempty"`
+	Op              OpType  `json:"op"`
+	Key             string  `json:"key"`
+	Value           string  `json:"value,omitempty"`
+	ClientID        string  `json:"client_id,omitempty"`
+	SequenceNum     uint64  `json:"sequence_num,omitempty"`
+	ExpectedVersion *uint64 `json:"expected_version,omitempty"`
 }
 
 // SnapshotState captures the full point-in-time state for log compaction.
@@ -152,12 +157,36 @@ func (s *KVStore) putLocked(key, value string) Item {
 // If the command with this (clientID, sequenceNum) was already executed,
 // the cached result is returned without re-incrementing versions or mutating state.
 func (s *KVStore) PutWithClient(clientID string, seqNum uint64, key, value string) Item {
+	item, _ := s.PutWithClientAndVersion(clientID, seqNum, key, value, nil)
+	return item
+}
+
+// PutWithClientAndVersion executes a Put with Raft §8 client deduplication and optional atomic CAS.
+// When expectedVersion is non-nil:
+//   - If *expectedVersion == 0, the key must not exist (create-only).
+//   - If *expectedVersion > 0, the key must exist and its Version must equal *expectedVersion.
+//
+// If the version does not match, ErrVersionMismatch is returned without modifying state.
+func (s *KVStore) PutWithClientAndVersion(clientID string, seqNum uint64, key, value string, expectedVersion *uint64) (Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if clientID != "" {
 		if session, ok := s.clientSessions[clientID]; ok && session.SequenceNum >= seqNum {
-			return session.Item
+			return session.Item, nil
+		}
+	}
+
+	if expectedVersion != nil {
+		existing, exists := s.data[key]
+		if *expectedVersion == 0 {
+			if exists {
+				return Item{}, ErrVersionMismatch
+			}
+		} else {
+			if !exists || existing.Version != *expectedVersion {
+				return Item{}, ErrVersionMismatch
+			}
 		}
 	}
 
@@ -170,7 +199,7 @@ func (s *KVStore) PutWithClient(clientID string, seqNum uint64, key, value strin
 		}
 	}
 
-	return item
+	return item, nil
 }
 
 // Revision returns the current global revision of the store.
@@ -252,8 +281,8 @@ func (s *KVStore) Apply(cmdBytes []byte) (Item, error) {
 
 	switch cmd.Op {
 	case OpPut:
-		item := s.PutWithClient(cmd.ClientID, cmd.SequenceNum, cmd.Key, cmd.Value)
-		return item, nil
+		item, err := s.PutWithClientAndVersion(cmd.ClientID, cmd.SequenceNum, cmd.Key, cmd.Value, cmd.ExpectedVersion)
+		return item, err
 
 	case OpGet:
 		item, err := s.Get(cmd.Key)

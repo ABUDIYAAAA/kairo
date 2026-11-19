@@ -846,9 +846,19 @@ func (s *RaftServer) ProposeWithTimeout(cmd state.Command, timeout time.Duration
 	}
 }
 
-// Put submits a key-value write operation through Raft consensus.
+// PutWithVersion submits a key-value write operation through Raft consensus with optional atomic CAS.
+func (s *RaftServer) PutWithVersion(key, value string, expectedVersion *uint64) (state.Item, error) {
+	return s.Propose(state.Command{
+		Op:              state.OpPut,
+		Key:             key,
+		Value:           value,
+		ExpectedVersion: expectedVersion,
+	})
+}
+
+// Put submits an unconditional key-value write operation through Raft consensus.
 func (s *RaftServer) Put(key, value string) (state.Item, error) {
-	return s.Propose(state.Command{Op: state.OpPut, Key: key, Value: value})
+	return s.PutWithVersion(key, value, nil)
 }
 
 // Delete submits a key deletion operation through Raft consensus.
@@ -977,11 +987,12 @@ func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *tra
 	switch args.Op {
 	case "PUT":
 		item, err := s.Propose(state.Command{
-			Op:          state.OpPut,
-			Key:         args.Key,
-			Value:       args.Value,
-			ClientID:    args.ClientID,
-			SequenceNum: args.SeqNum,
+			Op:              state.OpPut,
+			Key:             args.Key,
+			Value:           args.Value,
+			ClientID:        args.ClientID,
+			SequenceNum:     args.SeqNum,
+			ExpectedVersion: args.ExpectedVersion,
 		})
 		if err != nil {
 			reply.Error = err.Error()
@@ -1036,9 +1047,10 @@ func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *tra
 }
 
 // ExecuteOrForwardPut executes a PUT if leader, or transparently forwards to the cluster leader if follower.
-func (s *RaftServer) ExecuteOrForwardPut(key, value string) (state.Item, error) {
+// It supports optional atomic CAS via expectedVersion.
+func (s *RaftServer) ExecuteOrForwardPut(key, value string, expectedVersion *uint64) (state.Item, error) {
 	if s.Role() == state.Leader {
-		return s.Put(key, value)
+		return s.PutWithVersion(key, value, expectedVersion)
 	}
 
 	leaderID := s.Leader()
@@ -1054,15 +1066,19 @@ func (s *RaftServer) ExecuteOrForwardPut(key, value string) (state.Item, error) 
 	}
 
 	args := transport.ClientForwardArgs{
-		Op:    "PUT",
-		Key:   key,
-		Value: value,
+		Op:              "PUT",
+		Key:             key,
+		Value:           value,
+		ExpectedVersion: expectedVersion,
 	}
 	var reply transport.ClientForwardReply
 	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
 		return state.Item{}, fmt.Errorf("failed to forward write to leader %d: %w", leaderID, err)
 	}
 	if reply.Error != "" {
+		if reply.Error == state.ErrVersionMismatch.Error() {
+			return state.Item{}, state.ErrVersionMismatch
+		}
 		return state.Item{}, errors.New(reply.Error)
 	}
 	return reply.Item, nil

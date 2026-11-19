@@ -127,16 +127,19 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 			return
 		}
 		var req struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
+			Key             string  `json:"key"`
+			Value           string  `json:"value"`
+			ExpectedVersion *uint64 `json:"expected_version,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
 			http.Error(w, `{"error":"invalid JSON, key and value required"}`, http.StatusBadRequest)
 			return
 		}
-		item, err := rs.ExecuteOrForwardPut(req.Key, req.Value)
+		item, err := rs.ExecuteOrForwardPut(req.Key, req.Value, req.ExpectedVersion)
 		if err != nil {
-			if errors.Is(err, raft.ErrNotLeader) {
+			if errors.Is(err, state.ErrVersionMismatch) {
+				http.Error(w, `{"error":"version mismatch"}`, http.StatusConflict)
+			} else if errors.Is(err, raft.ErrNotLeader) {
 				http.Error(w, `{"error":"cluster has no elected leader"}`, http.StatusServiceUnavailable)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
