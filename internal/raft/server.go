@@ -878,10 +878,12 @@ func (s *RaftServer) LinearizableGet(key string) (state.Item, error) {
 	return s.LinearizableGetWithTimeout(key, 3*time.Second)
 }
 
-// LinearizableGetWithTimeout executes a linearizable read with a caller-provided timeout.
-func (s *RaftServer) LinearizableGetWithTimeout(key string, timeout time.Duration) (state.Item, error) {
+// LinearizableReadIndex executes a ReadIndex request through Raft consensus,
+// confirming active leadership with a quorum of peers without writing to disk or appending to the log,
+// and returning the safely committed readIndex.
+func (s *RaftServer) LinearizableReadIndex(timeout time.Duration) (uint64, error) {
 	if s.Role() != state.Leader {
-		return state.Item{}, ErrNotLeader
+		return 0, ErrNotLeader
 	}
 
 	s.mu.Lock()
@@ -896,26 +898,28 @@ func (s *RaftServer) LinearizableGetWithTimeout(key string, timeout time.Duratio
 		s.mu.Lock()
 		delete(s.pendingReads, reqKey)
 		s.mu.Unlock()
-		return state.Item{}, err
+		return 0, err
 	}
 
-	var readIndex uint64
 	select {
 	case res := <-readIndexCh:
 		if res.err != nil {
-			return state.Item{}, res.err
+			return 0, res.err
 		}
-		readIndex = res.readIndex
+		return res.readIndex, nil
 	case <-time.After(timeout):
 		s.mu.Lock()
 		delete(s.pendingReads, reqKey)
 		s.mu.Unlock()
-		return state.Item{}, ErrTimeout
+		return 0, ErrTimeout
 	case <-s.stopCh:
-		return state.Item{}, ErrStopped
+		return 0, ErrStopped
 	}
+}
 
-	// 2. Wait until state machine has applied all writes up to readIndex
+// waitAppliedAndGet waits until the node's local state machine has applied all writes
+// up to readIndex, then reads the requested key from the local state machine.
+func (s *RaftServer) waitAppliedAndGet(key string, readIndex uint64, timeout time.Duration) (state.Item, error) {
 	curApplied := atomic.LoadUint64(&s.lastApplied)
 	if curApplied >= readIndex {
 		// Fast path: all writes up to readIndex are already applied!
@@ -945,6 +949,15 @@ func (s *RaftServer) LinearizableGetWithTimeout(key string, timeout time.Duratio
 	case <-s.stopCh:
 		return state.Item{}, ErrStopped
 	}
+}
+
+// LinearizableGetWithTimeout executes a linearizable read with a caller-provided timeout.
+func (s *RaftServer) LinearizableGetWithTimeout(key string, timeout time.Duration) (state.Item, error) {
+	readIndex, err := s.LinearizableReadIndex(timeout)
+	if err != nil {
+		return state.Item{}, err
+	}
+	return s.waitAppliedAndGet(key, readIndex, timeout)
 }
 
 // Snapshot manually forces a snapshot creation and log compaction.
@@ -1024,6 +1037,16 @@ func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *tra
 			return err
 		}
 		reply.Item = item
+		reply.Status = "ok"
+		return nil
+
+	case "READ_INDEX":
+		readIndex, err := s.LinearizableReadIndex(3 * time.Second)
+		if err != nil {
+			reply.Error = err.Error()
+			return err
+		}
+		reply.ReadIndex = readIndex
 		reply.Status = "ok"
 		return nil
 
@@ -1119,7 +1142,12 @@ func (s *RaftServer) ExecuteOrForwardDelete(key string) (state.Item, error) {
 	return reply.Item, nil
 }
 
-// ExecuteOrForwardLinearizableGet executes a linearizable read if leader, or transparently forwards to leader if follower.
+// ExecuteOrForwardLinearizableGet executes a linearizable read.
+// If leader, it executes the ReadIndex protocol directly.
+// If follower, it executes Ongaro §6.4.1 Follower ReadIndex:
+//  1. Follower requests committed ReadIndex from leader (lightweight RPC; leader touches zero state machine data).
+//  2. Follower waits until its local appliedIndex >= ReadIndex.
+//  3. Follower reads the key from its own local state machine!
 func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, error) {
 	if s.Role() == state.Leader {
 		return s.LinearizableGet(key)
@@ -1137,21 +1165,23 @@ func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, er
 		return state.Item{}, fmt.Errorf("leader address for node %d unknown", leaderID)
 	}
 
+	// 1. Ask leader for committed ReadIndex
 	args := transport.ClientForwardArgs{
-		Op:  "GET",
-		Key: key,
+		Op: "READ_INDEX",
 	}
 	var reply transport.ClientForwardReply
 	if err := s.transport.ClientForward(leaderAddr, &args, &reply); err != nil {
-		return state.Item{}, fmt.Errorf("failed to forward read to leader %d: %w", leaderID, err)
+		return state.Item{}, fmt.Errorf("failed to get read index from leader %d: %w", leaderID, err)
 	}
 	if reply.Error != "" {
-		if reply.Error == state.ErrKeyNotFound.Error() {
-			return state.Item{}, state.ErrKeyNotFound
+		if reply.Error == ErrNotLeader.Error() {
+			return state.Item{}, ErrNotLeader
 		}
 		return state.Item{}, errors.New(reply.Error)
 	}
-	return reply.Item, nil
+
+	// 2 & 3. Follower waits for local catch-up up to ReadIndex and reads from its own state machine!
+	return s.waitAppliedAndGet(key, reply.ReadIndex, 3*time.Second)
 }
 
 func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, confState storage.ConfState) {

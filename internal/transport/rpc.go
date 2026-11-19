@@ -68,6 +68,7 @@ type ClientForwardReply struct {
 	Status    string
 	Error     string
 	ConfState storage.ConfState
+	ReadIndex uint64
 }
 
 // RaftHandler defines the methods a Raft node must implement to receive RPCs.

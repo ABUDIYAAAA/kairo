@@ -1,13 +1,16 @@
-.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos
+.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos build-proxy run-proxy
 
 BUILD_DIR := bin
 BINARY := $(BUILD_DIR)/kairo
 HARNESS_BINARY := $(BUILD_DIR)/chaos-harness
+PROXY_BINARY := $(BUILD_DIR)/kairo-proxy
 
 DURATION ?= 5s
 WORKERS ?= 80
 CHAOS_RATE ?= 100ms
 TARGET_OPS ?= 10000
+PROXY_LISTEN ?= :8999
+PROXY_ENDPOINTS ?= http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003
 
 PEERS_NODE1 := "2=127.0.0.1:8002,3=127.0.0.1:8003"
 PEERS_NODE2 := "1=127.0.0.1:8001,3=127.0.0.1:8003"
@@ -90,3 +93,13 @@ chaos-harness: build-harness
 # Run high-throughput chaos client test via go test
 test-chaos:
 	go test -v -count=1 -run TestClientChaosHarnessHighThroughput ./tests
+
+# Build Kairo L7 Cluster Proxy
+build-proxy:
+	@mkdir -p $(BUILD_DIR)
+	go build -o $(PROXY_BINARY) cmd/kairo-proxy/main.go
+	@echo "Build complete: $(PROXY_BINARY)"
+
+# Run Cluster Proxy router in foreground
+run-proxy: build-proxy
+	$(PROXY_BINARY) -listen=$(PROXY_LISTEN) -endpoints=$(PROXY_ENDPOINTS)
