@@ -43,11 +43,23 @@ func (c *Client) runWatchStream(
 ) {
 	defer close(ch)
 
+	// Combine caller's ctx with client closeCh so closing client terminates active HTTP connections immediately
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	go func() {
+		select {
+		case <-c.closeCh:
+			cancelStream()
+		case <-streamCtx.Done():
+		}
+	}()
+
 	lastSeenRev := opts.SinceRevision
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-streamCtx.Done():
 			return
 		case <-c.closeCh:
 			return
@@ -58,12 +70,21 @@ func (c *Client) runWatchStream(
 		if ep == "" {
 			select {
 			case ch <- WatchResponse{Err: ErrNoHealthyEndpoints}:
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				return
 			case <-c.closeCh:
 				return
 			}
-			time.Sleep(500 * time.Millisecond)
+			timer := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-streamCtx.Done():
+				timer.Stop()
+				return
+			case <-c.closeCh:
+				timer.Stop()
+				return
+			}
 			continue
 		}
 
@@ -79,10 +100,19 @@ func (c *Client) runWatchStream(
 
 		reqURL := ep + "/watch?" + params.Encode()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, reqURL, nil)
 		if err != nil {
 			c.pool.MarkFailed(idx)
-			time.Sleep(200 * time.Millisecond)
+			timer := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-streamCtx.Done():
+				timer.Stop()
+				return
+			case <-c.closeCh:
+				timer.Stop()
+				return
+			}
 			continue
 		}
 		req.Header.Set("Accept", "text/event-stream")
@@ -91,11 +121,14 @@ func (c *Client) runWatchStream(
 		if err != nil {
 			// Network failure connecting to this node
 			c.pool.MarkFailed(idx)
+			timer := time.NewTimer(200 * time.Millisecond)
 			select {
-			case <-time.After(200 * time.Millisecond):
-			case <-ctx.Done():
+			case <-timer.C:
+			case <-streamCtx.Done():
+				timer.Stop()
 				return
 			case <-c.closeCh:
+				timer.Stop()
 				return
 			}
 			continue
@@ -106,7 +139,7 @@ func (c *Client) runWatchStream(
 			_ = resp.Body.Close()
 			select {
 			case ch <- WatchResponse{Err: ErrCompacted}:
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 			case <-c.closeCh:
 			}
 			return
@@ -115,11 +148,14 @@ func (c *Client) runWatchStream(
 		if resp.StatusCode != http.StatusOK {
 			c.pool.MarkFailed(idx)
 			_ = resp.Body.Close()
+			timer := time.NewTimer(300 * time.Millisecond)
 			select {
-			case <-time.After(300 * time.Millisecond):
-			case <-ctx.Done():
+			case <-timer.C:
+			case <-streamCtx.Done():
+				timer.Stop()
 				return
 			case <-c.closeCh:
+				timer.Stop()
 				return
 			}
 			continue
@@ -129,7 +165,7 @@ func (c *Client) runWatchStream(
 		c.pool.MarkSuccess(idx)
 
 		// Read SSE stream
-		streamErr := c.consumeSSE(ctx, resp.Body, &lastSeenRev, ch)
+		streamErr := c.consumeSSE(streamCtx, resp.Body, &lastSeenRev, ch)
 		_ = resp.Body.Close()
 
 		if streamErr == nil || errors.Is(streamErr, context.Canceled) {
@@ -137,11 +173,14 @@ func (c *Client) runWatchStream(
 		}
 
 		// Connection dropped: brief backoff before transparently reconnecting
+		timer := time.NewTimer(100 * time.Millisecond)
 		select {
-		case <-time.After(100 * time.Millisecond):
-		case <-ctx.Done():
+		case <-timer.C:
+		case <-streamCtx.Done():
+			timer.Stop()
 			return
 		case <-c.closeCh:
+			timer.Stop()
 			return
 		}
 	}
@@ -174,24 +213,39 @@ func (c *Client) consumeSSE(
 
 		if strings.HasPrefix(trimmed, "data:") {
 			dataPayload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if currentData.Len() > 0 {
+				currentData.WriteByte('\n')
+			}
 			currentData.WriteString(dataPayload)
 		} else if trimmed == "" && currentData.Len() > 0 {
 			// Double newline signals completion of an SSE message block
 			var ev WatchEvent
-			if err := json.Unmarshal([]byte(currentData.String()), &ev); err == nil {
-				if ev.ModRevision > *lastSeenRev {
-					*lastSeenRev = ev.ModRevision
-				}
+			rawPayload := currentData.String()
+			currentData.Reset()
 
+			if err := json.Unmarshal([]byte(rawPayload), &ev); err != nil {
+				// Alert caller on unmarshal failure to preserve zero missed events guarantee
 				select {
-				case ch <- WatchResponse{Event: ev}:
+				case ch <- WatchResponse{Err: fmt.Errorf("kairo: failed to unmarshal watch event: %w", err)}:
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-c.closeCh:
 					return ErrClientClosed
 				}
+				continue
 			}
-			currentData.Reset()
+
+			if ev.ModRevision > *lastSeenRev {
+				*lastSeenRev = ev.ModRevision
+			}
+
+			select {
+			case ch <- WatchResponse{Event: ev}:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.closeCh:
+				return ErrClientClosed
+			}
 		}
 	}
 }

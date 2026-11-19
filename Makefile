@@ -1,7 +1,13 @@
-.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all
+.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos
 
 BUILD_DIR := bin
 BINARY := $(BUILD_DIR)/kairo
+HARNESS_BINARY := $(BUILD_DIR)/chaos-harness
+
+DURATION ?= 5s
+WORKERS ?= 80
+CHAOS_RATE ?= 100ms
+TARGET_OPS ?= 10000
 
 PEERS_NODE1 := "2=127.0.0.1:8002,3=127.0.0.1:8003"
 PEERS_NODE2 := "1=127.0.0.1:8001,3=127.0.0.1:8003"
@@ -70,3 +76,17 @@ test-sim:
 # Run all tests (unit tests + simulation tests)
 test-all:
 	go test -v -count=1 ./...
+
+# Build chaos harness binary
+build-harness:
+	@mkdir -p $(BUILD_DIR)
+	go build -o $(HARNESS_BINARY) cmd/chaos-harness/main.go
+	@echo "Build complete: $(HARNESS_BINARY)"
+
+# Run standalone 5-node chaos benchmark harness with client
+chaos-harness: build-harness
+	@$(HARNESS_BINARY) -duration=$(DURATION) -workers=$(WORKERS) -chaos-rate=$(CHAOS_RATE) -target-ops=$(TARGET_OPS)
+
+# Run high-throughput chaos client test via go test
+test-chaos:
+	go test -v -count=1 -run TestClientChaosHarnessHighThroughput ./tests

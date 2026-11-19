@@ -572,3 +572,143 @@ func TestClientWatchAutoReconnect(t *testing.T) {
 		t.Fatalf("expected reconnect since_rev=42, got %s", receivedSinceRev[1])
 	}
 }
+
+func TestClientDefaultTimeoutApplied(t *testing.T) {
+	// Server hangs indefinitely
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1 * time.Second)
+	}))
+	defer server.Close()
+
+	cli, err := New(Config{
+		Endpoints:      []string{server.URL},
+		RequestTimeout: 50 * time.Millisecond,
+		RetryAttempts:  1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer cli.Close()
+
+	// Pass context WITHOUT deadline - client must enforce RequestTimeout
+	start := time.Now()
+	_, err = cli.Get(context.Background(), "any-key")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("request took %v, expected default timeout around 50ms", elapsed)
+	}
+}
+
+func TestClient5xxCircuitBreaking(t *testing.T) {
+	var attempts int32
+	server500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, `{"error":"internal crash"}`, http.StatusInternalServerError)
+	}))
+	defer server500.Close()
+
+	cli, err := New(Config{
+		Endpoints:     []string{server500.URL},
+		RetryAttempts: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer cli.Close()
+
+	_, err = cli.Get(context.Background(), "crash-key")
+	if err == nil {
+		t.Fatalf("expected error from 500 server")
+	}
+
+	// Verify endpoint was marked failed
+	healthy := cli.pool.AllHealthy()
+	if len(healthy) != 1 {
+		// If all endpoints are failed, AllHealthy falls back to all
+	}
+	// Verify Pick chooses it but marked failed
+	cli.pool.mu.RLock()
+	isUnhealthy := time.Now().Before(cli.pool.endpoints[0].unhealthyUntil)
+	cli.pool.mu.RUnlock()
+	if !isUnhealthy {
+		t.Fatalf("expected 500 status code to mark endpoint in cooldown")
+	}
+}
+
+func TestWatchStreamParserEdgeCases(t *testing.T) {
+	// Server outputs:
+	// 1. Multi-line data block
+	// 2. Malformed JSON data block
+	// 3. Normal event followed by client close
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher.Flush()
+
+		// 1. Multi-line data block
+		_, _ = fmt.Fprintf(w, "event: PUT\ndata: {\"type\":\"PUT\",\ndata: \"key\":\"multi-line\",\ndata: \"value\":\"hello world\",\ndata: \"version\":1,\"mod_revision\":100}\n\n")
+		flusher.Flush()
+
+		// 2. Malformed JSON block
+		_, _ = fmt.Fprintf(w, "event: PUT\ndata: {this is broken json}\n\n")
+		flusher.Flush()
+
+		// 3. Keep connection open until closed
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	cli, err := New(Config{Endpoints: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	ctx := context.Background()
+	watchCh := cli.Watch(ctx, "multi-line")
+
+	// Read event 1: multi-line parsed correctly
+	select {
+	case resp := <-watchCh:
+		if resp.Err != nil {
+			t.Fatalf("unexpected error on multi-line: %v", resp.Err)
+		}
+		if resp.Event.Key != "multi-line" || resp.Event.Value != "hello world" || resp.Event.ModRevision != 100 {
+			t.Fatalf("unexpected parsed event: %+v", resp.Event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for multi-line event")
+	}
+
+	// Read event 2: malformed JSON returns error on channel instead of silent drop
+	select {
+	case resp := <-watchCh:
+		if resp.Err == nil {
+			t.Fatalf("expected error for malformed JSON, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for malformed json error")
+	}
+
+	// Test Client.Close() cancels the active stream immediately
+	start := time.Now()
+	cli.Close()
+
+	select {
+	case _, ok := <-watchCh:
+		if ok {
+			// May deliver remaining buffered or close
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("watch channel did not close within 1s after Client.Close()")
+	}
+	if time.Since(start) > 1500*time.Millisecond {
+		t.Fatalf("Close took too long to terminate stream")
+	}
+}

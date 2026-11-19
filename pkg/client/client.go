@@ -74,6 +74,14 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 		return nil, 0, ErrClientClosed
 	}
 
+	// Apply default RequestTimeout if caller context has no deadline
+	reqCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline && c.cfg.RequestTimeout > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, c.cfg.RequestTimeout)
+		defer cancel()
+	}
+
 	attempts := c.cfg.RetryAttempts
 	if attempts <= 0 {
 		attempts = 1
@@ -83,8 +91,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		select {
-		case <-ctx.Done():
-			return nil, 0, ctx.Err()
+		case <-reqCtx.Done():
+			return nil, 0, reqCtx.Err()
 		case <-c.closeCh:
 			return nil, 0, ErrClientClosed
 		default:
@@ -101,7 +109,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 			reqBody = bytes.NewReader(body)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+		req, err := http.NewRequestWithContext(reqCtx, method, url, reqBody)
 		if err != nil {
 			return nil, 0, fmt.Errorf("kairo: failed to build request: %w", err)
 		}
@@ -116,11 +124,14 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 			lastErr = err
 
 			if attempt+1 < attempts {
+				timer := time.NewTimer(c.cfg.RetryBackoff * time.Duration(1<<attempt))
 				select {
-				case <-time.After(c.cfg.RetryBackoff * time.Duration(1<<attempt)):
-				case <-ctx.Done():
-					return nil, 0, ctx.Err()
+				case <-timer.C:
+				case <-reqCtx.Done():
+					timer.Stop()
+					return nil, 0, reqCtx.Err()
 				case <-c.closeCh:
+					timer.Stop()
 					return nil, 0, ErrClientClosed
 				}
 			}
@@ -137,7 +148,28 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 			continue
 		}
 
-		// Server responded: mark endpoint successful
+		// If server responded with 5xx (internal server error / bad gateway), treat as endpoint failure
+		if resp.StatusCode >= http.StatusInternalServerError {
+			c.pool.MarkFailed(idx)
+			lastErr = fmt.Errorf("server error (HTTP %d): %s", resp.StatusCode, extractErrorMessage(respBytes))
+
+			if attempt+1 < attempts {
+				timer := time.NewTimer(c.cfg.RetryBackoff * time.Duration(1<<attempt))
+				select {
+				case <-timer.C:
+				case <-reqCtx.Done():
+					timer.Stop()
+					return nil, 0, reqCtx.Err()
+				case <-c.closeCh:
+					timer.Stop()
+					return nil, 0, ErrClientClosed
+				}
+				continue
+			}
+			return respBytes, resp.StatusCode, nil
+		}
+
+		// Server responded with non-5xx (< 500): mark endpoint successful
 		c.pool.MarkSuccess(idx)
 		return respBytes, resp.StatusCode, nil
 	}
