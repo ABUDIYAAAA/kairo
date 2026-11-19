@@ -990,6 +990,11 @@ func (s *RaftServer) Leader() int {
 	return s.node.Lead()
 }
 
+// LastApplied returns the highest log index applied to the node's state machine.
+func (s *RaftServer) LastApplied() uint64 {
+	return atomic.LoadUint64(&s.lastApplied)
+}
+
 // ClientForward handles forwarded operations from follower nodes to the leader.
 func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *transport.ClientForwardReply) error {
 	if s.Role() != state.Leader {

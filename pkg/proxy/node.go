@@ -5,16 +5,18 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Node represents a backend Kairo cluster member known to the proxy.
 type Node struct {
-	ID      int
 	URL     *url.URL
 	RawAddr string
 
+	mu        sync.RWMutex
+	ID        int
 	Role      string // "Leader", "Follower", "Learner", or "Unknown"
 	Term      uint64
 	LeaderID  int
@@ -62,12 +64,77 @@ func NewNode(rawURL string) (*Node, error) {
 	return n, nil
 }
 
+// UpdateStatus atomically updates the node's discovered cluster role and state.
+func (n *Node) UpdateStatus(id int, role string, term uint64, leaderID int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ID = id
+	n.Role = role
+	n.Term = term
+	n.LeaderID = leaderID
+	n.Healthy = true
+	n.LastSeen = time.Now()
+}
+
+// SetHealthy atomically sets the node's health status.
+func (n *Node) SetHealthy(healthy bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.Healthy = healthy
+}
+
+// GetID returns the node's cluster ID.
+func (n *Node) GetID() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.ID
+}
+
+// GetRole returns the node's current role string.
+func (n *Node) GetRole() string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Role
+}
+
+// GetLeaderID returns the leader ID known to this node.
+func (n *Node) GetLeaderID() int {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.LeaderID
+}
+
+// GetTerm returns the current term of the node.
+func (n *Node) GetTerm() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Term
+}
+
+// GetLastSeen returns the last seen timestamp of the node.
+func (n *Node) GetLastSeen() time.Time {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.LastSeen
+}
+
+// IsHealthy returns true if the node is marked healthy.
+func (n *Node) IsHealthy() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.Healthy
+}
+
 // IsLeader returns true if the node is actively healthy and reporting Leader role.
 func (n *Node) IsLeader() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.Healthy && n.Role == "Leader"
 }
 
 // IsNonLeader returns true if the node is healthy and not a leader (Follower or Learner).
 func (n *Node) IsNonLeader() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.Healthy && (n.Role == "Follower" || n.Role == "Learner")
 }

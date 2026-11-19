@@ -7,9 +7,35 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
+
+// Stats tracks client-side resilience metrics, absorbed failures, and retries.
+type Stats struct {
+	TotalOperations      uint64
+	RawHTTPAttempts      uint64
+	RetriedOperations    uint64
+	AbsorbedFailures     uint64
+	LeaderElectionErrors uint64
+	NetworkDropErrors    uint64
+	OCCRetries           uint64
+	EndpointsCooledDown  uint64
+	FinalFailures        uint64
+}
+
+type clientStats struct {
+	totalOperations      atomic.Uint64
+	rawHTTPAttempts      atomic.Uint64
+	retriedOperations    atomic.Uint64
+	absorbedFailures     atomic.Uint64
+	leaderElectionErrors atomic.Uint64
+	networkDropErrors    atomic.Uint64
+	occRetries           atomic.Uint64
+	endpointsCooledDown  atomic.Uint64
+	finalFailures        atomic.Uint64
+}
 
 // Client provides thread-safe access to a Kairo distributed key-value cluster.
 type Client struct {
@@ -17,6 +43,7 @@ type Client struct {
 	pool       *endpointPool
 	transport  *http.Transport
 	httpClient *http.Client
+	stats      clientStats
 	closed     atomic.Bool
 	closeCh    chan struct{}
 }
@@ -53,6 +80,21 @@ func New(cfg Config) (*Client, error) {
 	return c, nil
 }
 
+// Stats returns a snapshot of client metrics, absorbed failures, and retries.
+func (c *Client) Stats() Stats {
+	return Stats{
+		TotalOperations:      c.stats.totalOperations.Load(),
+		RawHTTPAttempts:      c.stats.rawHTTPAttempts.Load(),
+		RetriedOperations:    c.stats.retriedOperations.Load(),
+		AbsorbedFailures:     c.stats.absorbedFailures.Load(),
+		LeaderElectionErrors: c.stats.leaderElectionErrors.Load(),
+		NetworkDropErrors:    c.stats.networkDropErrors.Load(),
+		OCCRetries:           c.stats.occRetries.Load(),
+		EndpointsCooledDown:  c.stats.endpointsCooledDown.Load(),
+		FinalFailures:        c.stats.finalFailures.Load(),
+	}
+}
+
 // Close closes all idle HTTP connections and cancels any active streaming watches.
 func (c *Client) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
@@ -70,7 +112,10 @@ func (c *Client) isClosed() bool {
 // doRequest performs an HTTP request against the cluster with automatic endpoint rotation,
 // circuit-breaker tracking, and retries on network errors.
 func (c *Client) doRequest(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+	c.stats.totalOperations.Add(1)
+
 	if c.isClosed() {
+		c.stats.finalFailures.Add(1)
 		return nil, 0, ErrClientClosed
 	}
 
@@ -90,16 +135,21 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 	var lastErr error
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		c.stats.rawHTTPAttempts.Add(1)
+
 		select {
 		case <-reqCtx.Done():
+			c.stats.finalFailures.Add(1)
 			return nil, 0, reqCtx.Err()
 		case <-c.closeCh:
+			c.stats.finalFailures.Add(1)
 			return nil, 0, ErrClientClosed
 		default:
 		}
 
 		ep, idx := c.pool.Pick()
 		if ep == "" {
+			c.stats.finalFailures.Add(1)
 			return nil, 0, ErrNoHealthyEndpoints
 		}
 
@@ -111,6 +161,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 
 		req, err := http.NewRequestWithContext(reqCtx, method, url, reqBody)
 		if err != nil {
+			c.stats.finalFailures.Add(1)
 			return nil, 0, fmt.Errorf("kairo: failed to build request: %w", err)
 		}
 		if len(body) > 0 {
@@ -121,6 +172,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 		if err != nil {
 			// Network or connection error: mark endpoint unhealthy and retry
 			c.pool.MarkFailed(idx)
+			c.stats.absorbedFailures.Add(1)
+			c.stats.networkDropErrors.Add(1)
+			c.stats.endpointsCooledDown.Add(1)
 			lastErr = err
 
 			if attempt+1 < attempts {
@@ -129,9 +183,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 				case <-timer.C:
 				case <-reqCtx.Done():
 					timer.Stop()
+					c.stats.finalFailures.Add(1)
 					return nil, 0, reqCtx.Err()
 				case <-c.closeCh:
 					timer.Stop()
+					c.stats.finalFailures.Add(1)
 					return nil, 0, ErrClientClosed
 				}
 			}
@@ -144,6 +200,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 
 		if readErr != nil {
 			c.pool.MarkFailed(idx)
+			c.stats.absorbedFailures.Add(1)
+			c.stats.networkDropErrors.Add(1)
+			c.stats.endpointsCooledDown.Add(1)
 			lastErr = readErr
 			continue
 		}
@@ -151,6 +210,13 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 		// If server responded with 5xx (internal server error / bad gateway), treat as endpoint failure
 		if resp.StatusCode >= http.StatusInternalServerError {
 			c.pool.MarkFailed(idx)
+			c.stats.absorbedFailures.Add(1)
+			c.stats.endpointsCooledDown.Add(1)
+			if resp.StatusCode == http.StatusServiceUnavailable || strings.Contains(string(respBytes), "leader") {
+				c.stats.leaderElectionErrors.Add(1)
+			} else {
+				c.stats.networkDropErrors.Add(1)
+			}
 			lastErr = fmt.Errorf("server error (HTTP %d): %s", resp.StatusCode, extractErrorMessage(respBytes))
 
 			if attempt+1 < attempts {
@@ -159,20 +225,27 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 				case <-timer.C:
 				case <-reqCtx.Done():
 					timer.Stop()
+					c.stats.finalFailures.Add(1)
 					return nil, 0, reqCtx.Err()
 				case <-c.closeCh:
 					timer.Stop()
+					c.stats.finalFailures.Add(1)
 					return nil, 0, ErrClientClosed
 				}
 				continue
 			}
+			c.stats.finalFailures.Add(1)
 			return respBytes, resp.StatusCode, nil
 		}
 
 		// Server responded with non-5xx (< 500): mark endpoint successful
 		c.pool.MarkSuccess(idx)
+		if attempt > 0 {
+			c.stats.retriedOperations.Add(1)
+		}
 		return respBytes, resp.StatusCode, nil
 	}
 
+	c.stats.finalFailures.Add(1)
 	return nil, 0, fmt.Errorf("kairo: all %d retry attempts failed: %w", attempts, lastErr)
 }

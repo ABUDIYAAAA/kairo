@@ -215,6 +215,7 @@ func (c *Client) Update(
 		}
 
 		if errors.Is(err, ErrVersionMismatch) {
+			c.stats.occRetries.Add(1)
 			// Version conflict: jittered backoff before retrying
 			jitter := time.Duration(rand.Int63n(int64(options.Backoff)))
 			select {

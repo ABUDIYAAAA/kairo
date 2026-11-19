@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,24 +78,30 @@ func (cm *ChaosMonkey) currentLeader() int {
 }
 
 func (cm *ChaosMonkey) strike() {
+	numNodes := len(cm.h.nodes)
 	r := rand.Intn(5)
 	switch r {
 	case 0:
 		// 1. Partition the current leader into a minority, forcing re-election
 		leaderID := cm.currentLeader()
-		if leaderID > 0 {
-			cm.record(fmt.Sprintf("MAYHEM: Partitioning leader %d into minority {1,%d} vs rest", leaderID, leaderID))
-			// Create a 2-node minority and 3-node majority
-			other := (leaderID % 5) + 1
-			var minority []int
-			var majority []int
-			for i := 1; i <= 5; i++ {
-				if i == leaderID || i == other {
+		if leaderID > 0 && numNodes >= 3 {
+			majoritySize := (numNodes / 2) + 1
+			minoritySize := numNodes - majoritySize
+			minorityMap := map[int]bool{leaderID: true}
+			minority := []int{leaderID}
+			for i := 1; i <= numNodes && len(minority) < minoritySize; i++ {
+				if i != leaderID {
+					minorityMap[i] = true
 					minority = append(minority, i)
-				} else {
+				}
+			}
+			var majority []int
+			for i := 1; i <= numNodes; i++ {
+				if !minorityMap[i] {
 					majority = append(majority, i)
 				}
 			}
+			cm.record(fmt.Sprintf("MAYHEM: Partitioning leader %d into minority %v vs rest %v", leaderID, minority, majority))
 			cm.h.net.Partition(minority, majority)
 			time.Sleep(150 * time.Millisecond)
 			cm.h.net.Heal()
@@ -102,12 +110,14 @@ func (cm *ChaosMonkey) strike() {
 
 	case 1:
 		// 2. Disconnect a random node temporarily
-		nodeID := rand.Intn(5) + 1
-		cm.record(fmt.Sprintf("MAYHEM: Disconnecting node %d from mesh", nodeID))
-		cm.h.net.Disconnect(nodeID)
-		time.Sleep(100 * time.Millisecond)
-		cm.h.net.Reconnect(nodeID)
-		cm.record(fmt.Sprintf("MAYHEM: Reconnected node %d", nodeID))
+		if numNodes > 1 {
+			nodeID := rand.Intn(numNodes) + 1
+			cm.record(fmt.Sprintf("MAYHEM: Disconnecting node %d from mesh", nodeID))
+			cm.h.net.Disconnect(nodeID)
+			time.Sleep(100 * time.Millisecond)
+			cm.h.net.Reconnect(nodeID)
+			cm.record(fmt.Sprintf("MAYHEM: Reconnected node %d", nodeID))
+		}
 
 	case 2:
 		// 3. Inject packet loss across mesh
@@ -119,7 +129,7 @@ func (cm *ChaosMonkey) strike() {
 
 	case 3:
 		// 4. Force snapshot and log compaction on random nodes
-		nodeID := rand.Intn(5) + 1
+		nodeID := rand.Intn(numNodes) + 1
 		cm.record(fmt.Sprintf("MAYHEM: Triggering log compaction on node %d", nodeID))
 		if n, ok := cm.h.nodes[nodeID]; ok {
 			_ = n.Snapshot()
@@ -138,17 +148,24 @@ func (cm *ChaosMonkey) strike() {
 // TestClientChaosHarnessHighThroughput executes a high-throughput load test (aiming for >= 10,000 ops/sec)
 // using only the client SDK against a 5-node cluster while Chaos Monkey continuously disrupts the cluster.
 func TestClientChaosHarnessHighThroughput(t *testing.T) {
-	// 1. Spin up 5-node cluster
-	h, err := NewClusterHarness(5)
+	numNodes := 5
+	if envNodes := os.Getenv("NODES"); envNodes != "" {
+		if n, err := strconv.Atoi(envNodes); err == nil && n >= 1 {
+			numNodes = n
+		}
+	}
+
+	// 1. Spin up cluster
+	h, err := NewClusterHarness(numNodes)
 	if err != nil {
 		t.Fatalf("failed to create cluster harness: %v", err)
 	}
 	defer h.StopAll()
 
 	// 2. Spin up HTTP servers for each node wrapping api.NewHandler(node)
-	httpServers := make([]*httptest.Server, 5)
-	endpoints := make([]string, 5)
-	for i := 1; i <= 5; i++ {
+	httpServers := make([]*httptest.Server, numNodes)
+	endpoints := make([]string, numNodes)
+	for i := 1; i <= numNodes; i++ {
 		srv := httptest.NewServer(api.NewHandler(h.nodes[i]))
 		httpServers[i-1] = srv
 		endpoints[i-1] = srv.URL

@@ -135,7 +135,7 @@ func (rt *Router) executeWithLeaderFailover(w http.ResponseWriter, r *http.Reque
 	rt.tracker.Refresh(r.Context())
 	newLeader := rt.tracker.Leader()
 
-	if newLeader != nil && newLeader.ID != leader.ID {
+	if newLeader != nil && newLeader.GetID() != leader.GetID() {
 		newLeader.TotalRequests.Add(1)
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		rt.proxyToNode(w, r, newLeader)
@@ -161,8 +161,8 @@ func (rt *Router) routeDefault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *Router) proxyToNode(w http.ResponseWriter, r *http.Request, node *Node) {
-	w.Header().Set("X-Kairo-Target-Node", fmt.Sprintf("%d", node.ID))
-	w.Header().Set("X-Kairo-Target-Role", node.Role)
+	w.Header().Set("X-Kairo-Target-Node", fmt.Sprintf("%d", node.GetID()))
+	w.Header().Set("X-Kairo-Target-Role", node.GetRole())
 
 	node.ReverseProxy.ServeHTTP(w, r)
 }
@@ -198,16 +198,16 @@ func (rt *Router) handleProxyStatus(w http.ResponseWriter, r *http.Request) {
 	list := make([]nodeInfo, 0, len(nodes))
 	for _, n := range nodes {
 		list = append(list, nodeInfo{
-			ID:            n.ID,
+			ID:            n.GetID(),
 			URL:           n.RawAddr,
-			Role:          n.Role,
-			Healthy:       n.Healthy,
-			Term:          n.Term,
-			LeaderID:      n.LeaderID,
+			Role:          n.GetRole(),
+			Healthy:       n.IsHealthy(),
+			Term:          n.GetTerm(),
+			LeaderID:      n.GetLeaderID(),
 			ActiveWatches: n.ActiveWatches.Load(),
 			ActiveReads:   n.ActiveReads.Load(),
 			TotalRequests: n.TotalRequests.Load(),
-			LastSeen:      n.LastSeen,
+			LastSeen:      n.GetLastSeen(),
 		})
 	}
 

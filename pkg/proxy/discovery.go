@@ -148,20 +148,11 @@ func (ct *ClusterTracker) pollNode(ctx context.Context, n *Node) {
 		return
 	}
 
-	ct.mu.Lock()
-	n.ID = status.NodeID
-	n.Role = status.Role
-	n.Term = status.Term
-	n.LeaderID = status.LeaderID
-	n.Healthy = true
-	n.LastSeen = time.Now()
-	ct.mu.Unlock()
+	n.UpdateStatus(status.NodeID, status.Role, status.Term, status.LeaderID)
 }
 
 func (ct *ClusterTracker) markUnhealthy(n *Node) {
-	ct.mu.Lock()
-	n.Healthy = false
-	ct.mu.Unlock()
+	n.SetHealthy(false)
 }
 
 // Leader returns the current healthy Leader node, or nil if none found.
@@ -178,9 +169,10 @@ func (ct *ClusterTracker) Leader() *Node {
 
 	// 2. Fallback: find node matching LeaderID reported by healthy nodes
 	for _, n := range ct.nodes {
-		if n.Healthy && n.LeaderID > 0 {
+		leaderID := n.GetLeaderID()
+		if n.IsHealthy() && leaderID > 0 {
 			for _, candidate := range ct.nodes {
-				if candidate.Healthy && candidate.ID == n.LeaderID {
+				if candidate.IsHealthy() && candidate.GetID() == leaderID {
 					return candidate
 				}
 			}
@@ -212,7 +204,7 @@ func (ct *ClusterTracker) PickForWatch() *Node {
 
 	// Fallback to leader or any healthy node
 	for _, n := range ct.nodes {
-		if n.Healthy {
+		if n.IsHealthy() {
 			return n
 		}
 	}
@@ -239,7 +231,7 @@ func (ct *ClusterTracker) PickForStaleRead() *Node {
 	}
 
 	for _, n := range ct.nodes {
-		if n.Healthy {
+		if n.IsHealthy() {
 			return n
 		}
 	}
@@ -268,7 +260,7 @@ func (ct *ClusterTracker) PickForLinearRead() *Node {
 
 	// Fallback to leader or any healthy node
 	for _, n := range ct.nodes {
-		if n.Healthy {
+		if n.IsHealthy() {
 			return n
 		}
 	}

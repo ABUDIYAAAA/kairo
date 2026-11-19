@@ -5,10 +5,12 @@ BINARY := $(BUILD_DIR)/kairo
 HARNESS_BINARY := $(BUILD_DIR)/chaos-harness
 PROXY_BINARY := $(BUILD_DIR)/kairo-proxy
 
+NODES ?= 5
 DURATION ?= 5s
 WORKERS ?= 80
 CHAOS_RATE ?= 100ms
 TARGET_OPS ?= 10000
+RETRIES ?= 5
 PROXY_LISTEN ?= :8999
 PROXY_ENDPOINTS ?= http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003
 
@@ -86,13 +88,13 @@ build-harness:
 	go build -o $(HARNESS_BINARY) cmd/chaos-harness/main.go
 	@echo "Build complete: $(HARNESS_BINARY)"
 
-# Run standalone 5-node chaos benchmark harness with client
+# Run standalone chaos benchmark harness with client
 chaos-harness: build-harness
-	@$(HARNESS_BINARY) -duration=$(DURATION) -workers=$(WORKERS) -chaos-rate=$(CHAOS_RATE) -target-ops=$(TARGET_OPS)
+	@$(HARNESS_BINARY) -nodes=$(NODES) -duration=$(DURATION) -workers=$(WORKERS) -chaos-rate=$(CHAOS_RATE) -target-ops=$(TARGET_OPS) -retries=$(RETRIES)
 
 # Run high-throughput chaos client test via go test
 test-chaos:
-	go test -v -count=1 -run TestClientChaosHarnessHighThroughput ./tests
+	NODES=$(NODES) go test -v -count=1 -run TestClientChaosHarnessHighThroughput ./tests
 
 # Build Kairo L7 Cluster Proxy
 build-proxy:

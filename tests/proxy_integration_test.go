@@ -80,11 +80,12 @@ func TestClusterProxyEndToEndIntegration(t *testing.T) {
 
 	// Verify that the proxy routed the Watch to a Follower, NOT the Leader
 	for _, n := range tracker.Nodes() {
-		if n.ID == leaderID && n.ActiveWatches.Load() != 0 {
+		nodeID := n.GetID()
+		if nodeID == leaderID && n.ActiveWatches.Load() != 0 {
 			t.Fatalf("expected Leader (node %d) to have 0 active watches, got %d", leaderID, n.ActiveWatches.Load())
 		}
-		if n.ID != leaderID && n.ActiveWatches.Load() > 0 {
-			t.Logf("PASS: Watch connection successfully offloaded away from leader to Follower Node %d!", n.ID)
+		if nodeID != leaderID && n.ActiveWatches.Load() > 0 {
+			t.Logf("PASS: Watch connection successfully offloaded away from leader to Follower Node %d!", nodeID)
 		}
 	}
 
@@ -154,7 +155,7 @@ func TestClusterProxyEndToEndIntegration(t *testing.T) {
 	for _, n := range nodes {
 		totalRequests += n.TotalRequests.Load()
 		t.Logf("Node %d (%s): ActiveWatches=%d, ActiveReads=%d, TotalReqs=%d",
-			n.ID, n.Role, n.ActiveWatches.Load(), n.ActiveReads.Load(), n.TotalRequests.Load())
+			n.GetID(), n.GetRole(), n.ActiveWatches.Load(), n.ActiveReads.Load(), n.TotalRequests.Load())
 	}
 
 	if totalRequests == 0 {
