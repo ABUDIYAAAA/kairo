@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -98,6 +99,25 @@ func newMockNode(id int, role string, term uint64, leaderID int) *mockNodeServer
 	return m
 }
 
+func authedGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth("kairo", "kairo-secret")
+	return http.DefaultClient.Do(req)
+}
+
+func authedPost(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.SetBasicAuth("kairo", "kairo-secret")
+	return http.DefaultClient.Do(req)
+}
+
 func TestProxyRoutingMutationsToLeader(t *testing.T) {
 	node1 := newMockNode(1, "Leader", 1, 1)
 	defer node1.server.Close()
@@ -122,7 +142,7 @@ func TestProxyRoutingMutationsToLeader(t *testing.T) {
 
 	// Execute 10 PUTs via proxy
 	for i := 0; i < 10; i++ {
-		resp, err := http.Post(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k","value":"v"}`))
+		resp, err := authedPost(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k","value":"v"}`))
 		if err != nil {
 			t.Fatalf("PUT failed: %v", err)
 		}
@@ -176,6 +196,7 @@ func TestProxyAggressiveWatchSpreading(t *testing.T) {
 		go func(c context.Context) {
 			defer wg.Done()
 			req, _ := http.NewRequestWithContext(c, http.MethodGet, proxySrv.URL+"/watch?key=test", nil)
+			req.SetBasicAuth("kairo", "kairo-secret")
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				return
@@ -230,7 +251,7 @@ func TestProxyStaleReadSpreading(t *testing.T) {
 
 	// Send 20 stale reads
 	for i := 0; i < 20; i++ {
-		resp, err := http.Get(proxySrv.URL + "/get?key=test&stale=true")
+		resp, err := authedGet(proxySrv.URL + "/get?key=test&stale=true")
 		if err != nil {
 			t.Fatalf("stale GET failed: %v", err)
 		}
@@ -269,7 +290,7 @@ func TestProxyLeaderFailoverRetry(t *testing.T) {
 	defer proxySrv.Close()
 
 	// Initial PUT succeeds on node 1
-	resp, err := http.Post(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k1","value":"v1"}`))
+	resp, err := authedPost(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k1","value":"v1"}`))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("initial PUT failed: %v, status: %v", err, resp.StatusCode)
 	}
@@ -282,7 +303,7 @@ func TestProxyLeaderFailoverRetry(t *testing.T) {
 	node2.leaderID = 2
 
 	// Next PUT should detect node 1 error, trigger refresh, and redirect to node 2
-	resp2, err := http.Post(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k2","value":"v2"}`))
+	resp2, err := authedPost(proxySrv.URL+"/put", "application/json", strings.NewReader(`{"key":"k2","value":"v2"}`))
 	if err != nil {
 		t.Fatalf("failover PUT failed: %v", err)
 	}
@@ -316,7 +337,7 @@ func TestProxyInspectionEndpoint(t *testing.T) {
 	proxySrv := httptest.NewServer(router)
 	defer proxySrv.Close()
 
-	resp, err := http.Get(proxySrv.URL + "/proxy/status")
+	resp, err := authedGet(proxySrv.URL + "/proxy/status")
 	if err != nil {
 		t.Fatalf("proxy status failed: %v", err)
 	}
@@ -338,5 +359,77 @@ func TestProxyInspectionEndpoint(t *testing.T) {
 
 	if len(result.Nodes) != 2 {
 		t.Fatalf("expected 2 nodes reported, got %d", len(result.Nodes))
+	}
+}
+
+func TestProxySimpleAuthAndCustomProtocol(t *testing.T) {
+	node1 := newMockNode(1, "Leader", 1, 1)
+	defer node1.server.Close()
+
+	tracker, err := NewClusterTracker([]string{node1.server.URL}, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create tracker: %v", err)
+	}
+	defer tracker.Close()
+	tracker.Start()
+
+	time.Sleep(100 * time.Millisecond)
+
+	const expectedUser = "kairo-user"
+	const expectedPass = "kairo-pass"
+
+	router := NewRouter(tracker, expectedUser, expectedPass)
+	proxySrv := httptest.NewServer(router)
+	defer proxySrv.Close()
+
+	// 1. Healthz should bypass auth
+	healthResp, err := http.Get(proxySrv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("health check failed: %v", err)
+	}
+	_ = healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected healthz 200 OK, got %d", healthResp.StatusCode)
+	}
+	if healthResp.Header.Get("X-Kairo-Protocol") != "kairo/1.0" {
+		t.Fatalf("expected X-Kairo-Protocol: kairo/1.0, got %q", healthResp.Header.Get("X-Kairo-Protocol"))
+	}
+
+	// 2. Unauthenticated request to /get should return 401 Unauthorized
+	unauthResp, err := http.Get(proxySrv.URL + "/get?key=test")
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d", unauthResp.StatusCode)
+	}
+
+	// 3. Request with wrong credentials should return 401 Unauthorized
+	reqBad, _ := http.NewRequest(http.MethodGet, proxySrv.URL+"/get?key=test", nil)
+	reqBad.SetBasicAuth("wrong", "credentials")
+	badResp, err := http.DefaultClient.Do(reqBad)
+	if err != nil {
+		t.Fatalf("GET with bad auth failed: %v", err)
+	}
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d", badResp.StatusCode)
+	}
+
+	// 4. Request with valid credentials should succeed
+	reqGood, _ := http.NewRequest(http.MethodGet, proxySrv.URL+"/get?key=test", nil)
+	reqGood.SetBasicAuth(expectedUser, expectedPass)
+	reqGood.Header.Set("X-Kairo-Protocol", "kairo/1.0")
+	goodResp, err := http.DefaultClient.Do(reqGood)
+	if err != nil {
+		t.Fatalf("GET with good auth failed: %v", err)
+	}
+	_ = goodResp.Body.Close()
+	if goodResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", goodResp.StatusCode)
+	}
+	if goodResp.Header.Get("X-Kairo-Protocol") != "kairo/1.0" {
+		t.Fatalf("expected X-Kairo-Protocol: kairo/1.0, got %q", goodResp.Header.Get("X-Kairo-Protocol"))
 	}
 }

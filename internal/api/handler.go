@@ -7,13 +7,15 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/ABUDIYAAAA/kairo/internal/auth"
 	"github.com/ABUDIYAAAA/kairo/internal/raft"
 	"github.com/ABUDIYAAAA/kairo/internal/state"
 	"github.com/ABUDIYAAAA/kairo/internal/storage"
 )
 
 // NewHandler creates an http.Handler that routes client requests to a RaftServer instance.
-func NewHandler(rs *raft.RaftServer) http.Handler {
+// Authentication is always enabled and mandatory for all operational endpoints.
+func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -354,5 +356,11 @@ func NewHandler(rs *raft.RaftServer) http.Handler {
 		})
 	})
 
-	return mux
+	var mgr *auth.Manager
+	if len(authMgr) > 0 && authMgr[0] != nil {
+		mgr = authMgr[0]
+	} else {
+		mgr = auth.NewStaticManager(auth.DefaultUsername, auth.DefaultPassword)
+	}
+	return mgr.Middleware(mux)
 }

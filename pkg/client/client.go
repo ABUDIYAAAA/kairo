@@ -58,13 +58,15 @@ func New(cfg Config) (*Client, error) {
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   cfg.DialTimeout,
-			KeepAlive: 30 * time.Second,
+			KeepAlive: 60 * time.Second,
 		}).DialContext,
 		MaxIdleConns:          cfg.MaxIdleConns,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       cfg.IdleConnTimeout,
 		ResponseHeaderTimeout: cfg.RequestTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     false,
+		DisableCompression:    true,
 		ForceAttemptHTTP2:     false,
 	}
 
@@ -167,6 +169,12 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 		if len(body) > 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
+		if c.cfg.Protocol != "" {
+			req.Header.Set("X-Kairo-Protocol", c.cfg.Protocol)
+		}
+		if c.cfg.Username != "" || c.cfg.Password != "" {
+			req.SetBasicAuth(c.cfg.Username, c.cfg.Password)
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
@@ -205,6 +213,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 			c.stats.endpointsCooledDown.Add(1)
 			lastErr = readErr
 			continue
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			c.stats.finalFailures.Add(1)
+			return nil, resp.StatusCode, fmt.Errorf("kairo: authentication failed: %s", extractErrorMessage(respBytes))
 		}
 
 		// If server responded with 5xx (internal server error / bad gateway), treat as endpoint failure

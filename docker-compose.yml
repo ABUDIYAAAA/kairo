@@ -12,6 +12,8 @@ services:
     restart: unless-stopped
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
       - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
@@ -41,6 +43,8 @@ services:
     restart: unless-stopped
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
       - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
@@ -70,6 +74,8 @@ services:
     restart: unless-stopped
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
       - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
@@ -100,6 +106,8 @@ services:
     profiles: ["5-node", "all"]
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-5}
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
       - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
@@ -130,6 +138,8 @@ services:
     profiles: ["5-node", "all"]
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-5}
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
       - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
@@ -161,10 +171,14 @@ services:
     environment:
       - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
       - KAIRO_PROXY_LISTEN=:8999
+      - KAIRO_AUTH_USER=${KAIRO_AUTH_USER:-kairo}
+      - KAIRO_AUTH_PASSWORD=${KAIRO_AUTH_PASSWORD:-kairo-secret}
       - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
       - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
     ports:
       - "${KAIRO_PROXY_PORT:-8999}:8999"
+    volumes:
+      - kairo-proxy-data:/data
     depends_on:
       kairo-1:
         condition: service_healthy
@@ -197,3 +211,5 @@ volumes:
     name: kairo-data-4
   kairo-data-5:
     name: kairo-data-5
+  kairo-proxy-data:
+    name: kairo-proxy-data

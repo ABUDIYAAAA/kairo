@@ -289,6 +289,7 @@ func (cc *ContainerCluster) WaitLeader(ctx context.Context, timeout time.Duratio
 			}
 
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url+"/status", nil)
+			req.SetBasicAuth("kairo", "kairo-secret")
 			resp, err := httpClient.Do(req)
 			if err != nil {
 				continue

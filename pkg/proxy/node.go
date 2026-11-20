@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -9,6 +10,20 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// Shared upstream transport for proxying to backend cluster nodes.
+var upstreamTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   1 * time.Second,
+		KeepAlive: 60 * time.Second,
+	}).DialContext,
+	MaxIdleConns:        10000,
+	MaxIdleConnsPerHost: 2000,
+	IdleConnTimeout:     90 * time.Second,
+	DisableCompression: true,
+	ForceAttemptHTTP2:   false,
+}
 
 // Node represents a backend Kairo cluster member known to the proxy.
 type Node struct {
@@ -50,6 +65,7 @@ func NewNode(rawURL string) (*Node, error) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(parsed)
+	proxy.Transport = upstreamTransport
 	// FlushInterval = -1 ensures that SSE /watch events are immediately flushed to the client without buffering.
 	proxy.FlushInterval = -1
 

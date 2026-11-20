@@ -116,6 +116,12 @@ func (c *Client) runWatchStream(
 			continue
 		}
 		req.Header.Set("Accept", "text/event-stream")
+		if c.cfg.Protocol != "" {
+			req.Header.Set("X-Kairo-Protocol", c.cfg.Protocol)
+		}
+		if c.cfg.Username != "" || c.cfg.Password != "" {
+			req.SetBasicAuth(c.cfg.Username, c.cfg.Password)
+		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {

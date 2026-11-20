@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ABUDIYAAAA/kairo/internal/auth"
 	"github.com/ABUDIYAAAA/kairo/pkg/proxy"
 )
 
@@ -51,6 +52,8 @@ func main() {
 	clusterSizeFlag := flag.Int("cluster-size", 0, "Cluster size to auto-derive endpoints if none provided (default: KAIRO_CLUSTER_SIZE)")
 	endpointTemplateFlag := flag.String("endpoint-template", "", "Template for auto-derived endpoints (default: http://kairo-%d:9000 or KAIRO_CLIENT_HOST_TEMPLATE)")
 	pollIntervalFlag := flag.Duration("poll-interval", 0, "Interval between cluster topology probes (default: 1s or KAIRO_PROXY_POLL_INTERVAL)")
+	authUserFlag := flag.String("auth-user", "", "Optional username for client authentication (default: KAIRO_AUTH_USER)")
+	authPasswordFlag := flag.String("auth-password", "", "Optional password for client authentication (default: KAIRO_AUTH_PASSWORD)")
 	logLevelFlag := flag.String("log-level", "", "Logging level: debug, info, warn, error")
 	logFormatFlag := flag.String("log-format", "", "Logging format: text, json")
 
@@ -141,10 +144,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	authUser := ""
+	if *authUserFlag != "" {
+		authUser = *authUserFlag
+	} else if env := os.Getenv("KAIRO_AUTH_USER"); env != "" {
+		authUser = env
+	}
+
+	authPassword := ""
+	if *authPasswordFlag != "" {
+		authPassword = *authPasswordFlag
+	} else if env := os.Getenv("KAIRO_AUTH_PASSWORD"); env != "" {
+		authPassword = env
+	}
+
+	proxyDataDir := os.Getenv("KAIRO_PROXY_DATA_DIR")
+	if proxyDataDir == "" {
+		if fi, err := os.Stat("/data"); err == nil && fi.IsDir() {
+			proxyDataDir = "/data"
+		} else {
+			proxyDataDir = "data/proxy"
+		}
+	}
+
+	authMgr, err := auth.InitOrLoadCredentials(proxyDataDir, authUser, authPassword)
+	if err != nil {
+		slog.Error("failed to initialize auth credentials for proxy", "error", err)
+		os.Exit(1)
+	}
+
 	cfg := proxy.Config{
 		ListenAddr:   listenAddr,
 		Endpoints:    endpoints,
 		PollInterval: pollInterval,
+		AuthUser:     authMgr.Username(),
+		AuthPassword: authMgr.Password(),
 	}
 
 	srv, err := proxy.NewServer(cfg)
@@ -157,6 +191,8 @@ func main() {
 		"listen", cfg.ListenAddr,
 		"seed_endpoints", cfg.Endpoints,
 		"poll_interval", cfg.PollInterval,
+		"auth_user", cfg.AuthUser,
+		"auth_file", authMgr.Path(),
 	)
 
 	go func() {

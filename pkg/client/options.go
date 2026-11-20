@@ -2,11 +2,13 @@ package client
 
 import (
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 )
 
 const (
+	DefaultProxyPort      = "8999"
 	defaultDialTimeout    = 2 * time.Second
 	defaultRequestTimeout = 5 * time.Second
 	defaultMaxIdleConns   = 100
@@ -20,8 +22,17 @@ const (
 
 // Config configures a Kairo client instance.
 type Config struct {
-	// Endpoints is a slice of Kairo node HTTP base URLs (e.g. []string{"http://127.0.0.1:8001", "http://127.0.0.1:8002"}).
+	// Endpoints is a slice of Kairo node HTTP base URLs (e.g. []string{"http://127.0.0.1:8001", "kairo://127.0.0.1:8999"}).
 	Endpoints []string
+
+	// Username for Kairo authentication.
+	Username string
+
+	// Password for Kairo authentication.
+	Password string
+
+	// Protocol specifies the custom protocol identifier (default: "kairo/1.0").
+	Protocol string
 
 	// DialTimeout is the maximum time to wait for a TCP connection to be established. Default: 2s.
 	DialTimeout time.Duration
@@ -55,12 +66,47 @@ func (c *Config) setDefaultsAndValidate() error {
 		if ep == "" {
 			return errors.New("kairo: empty endpoint URL provided")
 		}
-		if !strings.HasPrefix(ep, "http://") && !strings.HasPrefix(ep, "https://") {
-			ep = "http://" + ep
+
+		scheme := "http"
+		raw := ep
+		if strings.HasPrefix(ep, "kairos://") || strings.HasPrefix(ep, "https://") {
+			scheme = "https"
+			raw = "https://" + strings.TrimPrefix(strings.TrimPrefix(ep, "kairos://"), "https://")
+		} else if strings.HasPrefix(ep, "kairo://") || strings.HasPrefix(ep, "http://") {
+			scheme = "http"
+			raw = "http://" + strings.TrimPrefix(strings.TrimPrefix(ep, "kairo://"), "http://")
+		} else {
+			raw = "http://" + ep
 		}
+
+		parsed, err := url.Parse(raw)
+		if err == nil && parsed != nil {
+			if parsed.User != nil {
+				if c.Username == "" {
+					c.Username = parsed.User.Username()
+				}
+				if pass, ok := parsed.User.Password(); ok && c.Password == "" {
+					c.Password = pass
+				}
+				parsed.User = nil
+			}
+			if parsed.Port() == "" && !strings.Contains(parsed.Host, ":") && parsed.Host != "" {
+				parsed.Host = parsed.Host + ":" + DefaultProxyPort
+			}
+			parsed.Scheme = scheme
+			ep = parsed.String()
+		}
+
 		c.Endpoints[i] = strings.TrimRight(ep, "/")
 	}
 
+	if c.Username == "" && c.Password == "" {
+		c.Username = "kairo"
+		c.Password = "kairo-secret"
+	}
+	if c.Protocol == "" {
+		c.Protocol = "kairo/1.0"
+	}
 	if c.DialTimeout <= 0 {
 		c.DialTimeout = defaultDialTimeout
 	}

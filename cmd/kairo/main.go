@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ABUDIYAAAA/kairo/internal/api"
+	"github.com/ABUDIYAAAA/kairo/internal/auth"
 	"github.com/ABUDIYAAAA/kairo/internal/raft"
 	"github.com/ABUDIYAAAA/kairo/internal/storage"
 	"github.com/ABUDIYAAAA/kairo/internal/transport"
@@ -70,10 +71,10 @@ func setupLogger(levelStr, formatStr string) {
 	slog.SetDefault(logger)
 }
 
-func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
+func startClientHTTP(addr string, rs *raft.RaftServer, authMgr *auth.Manager) *http.Server {
 	server := &http.Server{
 		Addr:    addr,
-		Handler: api.NewHandler(rs),
+		Handler: api.NewHandler(rs, authMgr),
 	}
 
 	go func() {
@@ -173,8 +174,22 @@ func main() {
 	}
 	defer srv.Close()
 
-	// 5. Start HTTP client server for linearizable KV operations
-	httpSrv := startClientHTTP(cfg.ClientAddr, rServer)
+	// 5. Initialize persistent authentication (volume purge required to reset)
+	authUser := os.Getenv("KAIRO_AUTH_USER")
+	authPass := os.Getenv("KAIRO_AUTH_PASSWORD")
+	authMgr, err := auth.InitOrLoadCredentials(cfg.DataDir, authUser, authPass)
+	if err != nil {
+		slog.Error("failed to initialize auth credentials", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("authentication initialized and enforced",
+		slog.String("username", authMgr.Username()),
+		slog.String("auth_file", authMgr.Path()),
+	)
+
+	// 6. Start HTTP client server for linearizable KV operations
+	httpSrv := startClientHTTP(cfg.ClientAddr, rServer, authMgr)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

@@ -34,16 +34,27 @@ type ClusterTracker struct {
 	nodes        []*Node
 	httpClient   *http.Client
 	pollInterval time.Duration
+	authUser     string
+	authPassword string
 	rrCounter    atomic.Uint64
 
 	stopCh chan struct{}
 	doneCh chan struct{}
 }
 
-// NewClusterTracker creates a new cluster tracker seeded with endpoints.
-func NewClusterTracker(endpoints []string, pollInterval time.Duration) (*ClusterTracker, error) {
+// NewClusterTracker creates a new cluster tracker seeded with endpoints and optional credentials.
+func NewClusterTracker(endpoints []string, pollInterval time.Duration, auth ...string) (*ClusterTracker, error) {
 	if pollInterval <= 0 {
 		pollInterval = 1 * time.Second
+	}
+
+	user := "kairo"
+	pass := "kairo-secret"
+	if len(auth) > 0 && auth[0] != "" {
+		user = auth[0]
+	}
+	if len(auth) > 1 && auth[1] != "" {
+		pass = auth[1]
 	}
 
 	nodes := make([]*Node, 0, len(endpoints))
@@ -58,6 +69,8 @@ func NewClusterTracker(endpoints []string, pollInterval time.Duration) (*Cluster
 	ct := &ClusterTracker{
 		nodes:        nodes,
 		pollInterval: pollInterval,
+		authUser:     user,
+		authPassword: pass,
 		httpClient: &http.Client{
 			Timeout: 1 * time.Second,
 		},
@@ -128,6 +141,9 @@ func (ct *ClusterTracker) pollNode(ctx context.Context, n *Node) {
 	if err != nil {
 		ct.markUnhealthy(n)
 		return
+	}
+	if ct.authUser != "" || ct.authPassword != "" {
+		req.SetBasicAuth(ct.authUser, ct.authPassword)
 	}
 
 	resp, err := ct.httpClient.Do(req)

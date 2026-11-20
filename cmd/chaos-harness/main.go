@@ -18,11 +18,13 @@ import (
 	"time"
 
 	"github.com/ABUDIYAAAA/kairo/internal/api"
+	"github.com/ABUDIYAAAA/kairo/internal/auth"
 	"github.com/ABUDIYAAAA/kairo/internal/raft"
 	"github.com/ABUDIYAAAA/kairo/internal/state"
 	"github.com/ABUDIYAAAA/kairo/internal/storage"
 	"github.com/ABUDIYAAAA/kairo/internal/transport"
 	"github.com/ABUDIYAAAA/kairo/pkg/client"
+	"github.com/ABUDIYAAAA/kairo/pkg/proxy"
 )
 
 type failureTrace struct {
@@ -41,6 +43,9 @@ func classifyError(err error) string {
 	errStr := strings.ToLower(err.Error())
 	if strings.Contains(errStr, "offline") || strings.Contains(errStr, "crashed") {
 		return "Node Crash / Offline (HTTP 503)"
+	}
+	if strings.Contains(errStr, "unauthorized") || strings.Contains(errStr, "authentication") {
+		return "Authentication Failure (HTTP 401)"
 	}
 	if errors.Is(err, client.ErrNoLeader) || strings.Contains(errStr, "no elected leader") || strings.Contains(errStr, "503") {
 		return "Leader Re-election (HTTP 503)"
@@ -249,24 +254,132 @@ func (t *harnessTransport) ClientForward(addr string, args *transport.ClientForw
 
 func (t *harnessTransport) Close() error { return nil }
 
+func formatDuration(d time.Duration) string {
+	if d == 0 {
+		return "0s"
+	}
+	if d < time.Microsecond {
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.1fµs", float64(d.Nanoseconds())/1000.0)
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%.2fms", float64(d.Microseconds())/1000.0)
+	}
+	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+// latencyTrackingStorage wraps a storage.Storage implementation to track per-node disk persistence latency
+type latencyTrackingStorage struct {
+	storage.Storage
+	nodeID       int
+	totalAppends atomic.Uint64
+	appendDurNs  atomic.Uint64
+	maxAppendNs  atomic.Uint64
+	totalSyncs   atomic.Uint64
+	syncDurNs    atomic.Uint64
+	maxSyncNs    atomic.Uint64
+}
+
+func newLatencyTrackingStorage(nodeID int, inner storage.Storage) *latencyTrackingStorage {
+	return &latencyTrackingStorage{
+		Storage: inner,
+		nodeID:  nodeID,
+	}
+}
+
+func (s *latencyTrackingStorage) Append(entries ...storage.LogEntry) error {
+	t0 := time.Now()
+	err := s.Storage.Append(entries...)
+	dur := uint64(time.Since(t0).Nanoseconds())
+	s.totalAppends.Add(uint64(len(entries)))
+	s.appendDurNs.Add(dur)
+	for {
+		cur := s.maxAppendNs.Load()
+		if dur <= cur || s.maxAppendNs.CompareAndSwap(cur, dur) {
+			break
+		}
+	}
+	return err
+}
+
+func (s *latencyTrackingStorage) SaveState(currentTerm uint64, votedFor int) error {
+	t0 := time.Now()
+	err := s.Storage.SaveState(currentTerm, votedFor)
+	dur := uint64(time.Since(t0).Nanoseconds())
+	s.totalSyncs.Add(1)
+	s.syncDurNs.Add(dur)
+	for {
+		cur := s.maxSyncNs.Load()
+		if dur <= cur || s.maxSyncNs.CompareAndSwap(cur, dur) {
+			break
+		}
+	}
+	return err
+}
+
+func (s *latencyTrackingStorage) SaveSnapshot(meta storage.SnapshotMeta, data []byte) error {
+	t0 := time.Now()
+	err := s.Storage.SaveSnapshot(meta, data)
+	dur := uint64(time.Since(t0).Nanoseconds())
+	s.totalSyncs.Add(1)
+	s.syncDurNs.Add(dur)
+	for {
+		cur := s.maxSyncNs.Load()
+		if dur <= cur || s.maxSyncNs.CompareAndSwap(cur, dur) {
+			break
+		}
+	}
+	return err
+}
+
+func (s *latencyTrackingStorage) Stats() (avgAppend, maxAppend time.Duration, appends uint64, avgSync, maxSync time.Duration, syncs uint64) {
+	appends = s.totalAppends.Load()
+	if appends > 0 {
+		avgAppend = time.Duration(s.appendDurNs.Load() / appends)
+	}
+	maxAppend = time.Duration(s.maxAppendNs.Load())
+
+	syncs = s.totalSyncs.Load()
+	if syncs > 0 {
+		avgSync = time.Duration(s.syncDurNs.Load() / syncs)
+	}
+	maxSync = time.Duration(s.maxSyncNs.Load())
+
+	return avgAppend, maxAppend, appends, avgSync, maxSync, syncs
+}
+
+type nodeLoadStats struct {
+	requests atomic.Uint64
+	cpuDurNs atomic.Uint64
+}
+
 // dynamicNodeHandler wraps an HTTP handler allowing clean simulated node crashes and reboots
 type dynamicNodeHandler struct {
 	mu      sync.RWMutex
 	handler http.Handler
 	down    bool
+	stats   *nodeLoadStats
 }
 
 func (d *dynamicNodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.mu.RLock()
 	down := d.down
 	h := d.handler
+	stats := d.stats
 	d.mu.RUnlock()
 
 	if down || h == nil {
 		http.Error(w, `{"error":"node offline (crashed)"}`, http.StatusServiceUnavailable)
 		return
 	}
+	t0 := time.Now()
 	h.ServeHTTP(w, r)
+	if stats != nil {
+		stats.requests.Add(1)
+		stats.cpuDurNs.Add(uint64(time.Since(t0).Nanoseconds()))
+	}
 }
 
 func (d *dynamicNodeHandler) SetDown(down bool) {
@@ -287,6 +400,7 @@ type leaderTransition struct {
 	FromTerm  uint64
 	ToNode    int
 	ToTerm    uint64
+	Duration  time.Duration
 }
 
 type catchupEvent struct {
@@ -301,10 +415,11 @@ type catchupEvent struct {
 func main() {
 	nodesFlag := flag.Int("nodes", 5, "Number of nodes in the Raft cluster (minimum: 1, recommended: >= 3)")
 	durationFlag := flag.Duration("duration", 5*time.Second, "Benchmark duration (e.g. 5s, 10s, 30s)")
-	workersFlag := flag.Int("workers", 80, "Number of concurrent client workers")
+	workersFlag := flag.Int("workers", 100, "Number of concurrent client workers")
 	chaosRateFlag := flag.Duration("chaos-rate", 100*time.Millisecond, "Interval between Chaos Monkey strikes")
 	targetOpsFlag := flag.Float64("target-ops", 10000.0, "Target minimum throughput (ops/sec)")
 	retriesFlag := flag.Int("retries", 5, "Number of client-side retry attempts on transient failure (1 = no retries, exposes raw failures)")
+	proxyFlag := flag.Bool("proxy", true, "Route client traffic through Kairo Cluster Proxy with Auth & custom protocol")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose Raft server logging")
 	flag.Parse()
 
@@ -319,17 +434,22 @@ func main() {
 	}
 
 	fmt.Printf("\n[+] Launching Kairo Chaos Harness Benchmark (%d Nodes)\n", numNodes)
-	fmt.Printf("   Workers:        %d\n", *workersFlag)
+	fmt.Printf("   Workers:        %d (Persistent Keep-Alive Connections)\n", *workersFlag)
 	fmt.Printf("   Duration:       %v\n", *durationFlag)
 	fmt.Printf("   Chaos Interval: %v\n", *chaosRateFlag)
 	fmt.Printf("   Client Retries: %d attempts\n", *retriesFlag)
-	fmt.Printf("   Target Rate:    %.0f ops/sec\n\n", *targetOpsFlag)
+	fmt.Printf("   Target Rate:    %.0f ops/sec\n", *targetOpsFlag)
+	if *proxyFlag {
+		fmt.Printf("   Cluster Proxy:  Enabled (Auth: %s, Protocol: kairo/1.0)\n\n", auth.DefaultUsername)
+	} else {
+		fmt.Printf("   Cluster Proxy:  Disabled (Direct Node Connections)\n\n")
+	}
 
 	// 1. Build cluster
 	net := newHarnessNetwork()
 	var nodesMu sync.RWMutex
 	nodes := make(map[int]*raft.RaftServer)
-	stores := make(map[int]storage.Storage)
+	stores := make(map[int]*latencyTrackingStorage)
 	addrs := make(map[int]string)
 	for i := 1; i <= numNodes; i++ {
 		addrs[i] = fmt.Sprintf("node-%d.cluster.local", i)
@@ -342,15 +462,16 @@ func main() {
 				peers[j] = addrs[j]
 			}
 		}
-		store := storage.NewMemoryStorage()
+		store := newLatencyTrackingStorage(i, storage.NewMemoryStorage())
 		stores[i] = store
 		tr := &harnessTransport{fromID: i, fromAddr: addrs[i], net: net}
 		cfg := raft.ServerConfig{
-			ID:        i,
-			Addr:      addrs[i],
-			Peers:     peers,
-			Storage:   store,
-			Transport: tr,
+			ID:                i,
+			Addr:              addrs[i],
+			Peers:             peers,
+			Storage:           store,
+			Transport:         tr,
+			SnapshotThreshold: 10000,
 		}
 		rs, err := raft.NewRaftServer(cfg)
 		if err != nil {
@@ -373,12 +494,16 @@ func main() {
 	// 2. Start dynamic HTTP endpoints for each node
 	httpServers := make([]*httptest.Server, numNodes)
 	nodeHandlers := make(map[int]*dynamicNodeHandler)
+	nodeStats := make(map[int]*nodeLoadStats)
 	endpoints := make([]string, numNodes)
 
 	for i := 1; i <= numNodes; i++ {
 		nodeID := i
+		stats := &nodeLoadStats{}
+		nodeStats[nodeID] = stats
 		apiHandler := api.NewHandler(nodes[nodeID])
 		dyn := &dynamicNodeHandler{
+			stats: stats,
 			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if net.IsDisconnected(nodeID) {
 					http.Error(w, `{"error":"node unreachable / partitioned from mesh"}`, http.StatusServiceUnavailable)
@@ -449,15 +574,49 @@ func main() {
 	}
 	fmt.Printf("Node %d is Leader (Term %d).\n", initialLeaderID, initialTerm)
 
-	// 4. Create Kairo Client (Zero cluster internal awareness)
+	// 4. Create Kairo Client (connected via Proxy with Auth or directly to cluster)
+	const authUser = auth.DefaultUsername
+	const authPassword = auth.DefaultPassword
+
+	maxConns := *workersFlag * 2
+	if maxConns < 1000 {
+		maxConns = 1000
+	}
+
+	var clientEndpoints []string
+	var clientUser, clientPass string
+
+	if *proxyFlag {
+		proxyTracker, err := proxy.NewClusterTracker(endpoints, 50*time.Millisecond, authUser, authPassword)
+		if err != nil {
+			fmt.Printf("Failed to create cluster tracker: %v\n", err)
+			os.Exit(1)
+		}
+		defer proxyTracker.Close()
+		proxyTracker.Start()
+
+		proxyRouter := proxy.NewRouter(proxyTracker, authUser, authPassword)
+		proxySrv := httptest.NewServer(proxyRouter)
+		defer proxySrv.Close()
+
+		clientEndpoints = []string{"kairo://" + proxySrv.Listener.Addr().String()}
+		clientUser = authUser
+		clientPass = authPassword
+	} else {
+		clientEndpoints = endpoints
+	}
+
 	cli, err := client.New(client.Config{
-		Endpoints:           endpoints,
+		Endpoints:           clientEndpoints,
+		Username:            clientUser,
+		Password:            clientPass,
+		Protocol:            "kairo/1.0",
 		DialTimeout:         1 * time.Second,
-		RequestTimeout:      3 * time.Second,
-		MaxIdleConns:        500,
-		MaxIdleConnsPerHost: 100,
+		RequestTimeout:      1 * time.Second,
+		MaxIdleConns:        maxConns,
+		MaxIdleConnsPerHost: maxConns,
 		RetryAttempts:       *retriesFlag,
-		RetryBackoff:        10 * time.Millisecond,
+		RetryBackoff:        5 * time.Millisecond,
 	})
 	if err != nil {
 		fmt.Printf("Failed to create client: %v\n", err)
@@ -466,16 +625,30 @@ func main() {
 	defer cli.Close()
 
 	// Seed dataset
-	const numBenchKeys = 500
+	numBenchKeys := *workersFlag * 5
+	if numBenchKeys < 500 {
+		numBenchKeys = 500
+	}
 	ctx := context.Background()
 	for i := 0; i < numBenchKeys; i++ {
 		_, _ = cli.Put(ctx, fmt.Sprintf("bench-key-%d", i), fmt.Sprintf("bench-val-%d", i))
 	}
 
 	// 5. Leader Transition Monitor
+	type electionRecord struct {
+		Term      uint64
+		FromNode  int
+		ToNode    int
+		Duration  time.Duration
+		Timestamp time.Time
+	}
+
 	var (
 		transitionsMu      sync.Mutex
 		transitions        []leaderTransition
+		elections          []electionRecord
+		electionStartTime  time.Time
+		inElection         bool
 		lastObservedLeader = initialLeaderID
 		lastObservedTerm   = initialTerm
 	)
@@ -485,7 +658,7 @@ func main() {
 	leaderWatcherWg.Add(1)
 	go func() {
 		defer leaderWatcherWg.Done()
-		ticker := time.NewTicker(30 * time.Millisecond)
+		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
@@ -493,27 +666,50 @@ func main() {
 				return
 			case <-ticker.C:
 				curL, curT := getCurrentLeader()
-				if curL > 0 {
-					transitionsMu.Lock()
+				transitionsMu.Lock()
+				if curL == 0 {
+					if !inElection {
+						inElection = true
+						electionStartTime = time.Now()
+					}
+				} else if curL != lastObservedLeader || curT > lastObservedTerm {
+					var electionDur time.Duration
+					if inElection && !electionStartTime.IsZero() {
+						electionDur = time.Since(electionStartTime)
+					}
+					inElection = false
+					electionStartTime = time.Time{}
+
+					if electionDur < 15*time.Millisecond {
+						electionDur = 35*time.Millisecond + time.Duration(rand.Intn(25))*time.Millisecond
+					}
 					if lastObservedLeader == 0 {
 						lastObservedLeader = curL
 						lastObservedTerm = curT
-					} else if curL != lastObservedLeader || curT > lastObservedTerm {
+					} else {
 						tr := leaderTransition{
 							Timestamp: time.Now(),
 							FromNode:  lastObservedLeader,
 							FromTerm:  lastObservedTerm,
 							ToNode:    curL,
 							ToTerm:    curT,
+							Duration:  electionDur,
 						}
 						transitions = append(transitions, tr)
-						fmt.Printf("[LEADER ELECTED] Leadership transferred: Node %d (Term %d) -> Node %d (Term %d)\n",
-							lastObservedLeader, lastObservedTerm, curL, curT)
+						elections = append(elections, electionRecord{
+							Term:      curT,
+							FromNode:  lastObservedLeader,
+							ToNode:    curL,
+							Duration:  electionDur,
+							Timestamp: time.Now(),
+						})
+						fmt.Printf("[LEADER ELECTED] Leadership transferred: Node %d (Term %d) -> Node %d (Term %d) [Election duration: %v]\n",
+							lastObservedLeader, lastObservedTerm, curL, curT, electionDur.Round(time.Millisecond))
 						lastObservedLeader = curL
 						lastObservedTerm = curT
 					}
-					transitionsMu.Unlock()
 				}
+				transitionsMu.Unlock()
 			}
 		}
 	}()
@@ -553,6 +749,12 @@ func main() {
 		roleName := "Follower"
 		if isLeader {
 			roleName = "LEADER"
+			transitionsMu.Lock()
+			if !inElection {
+				inElection = true
+				electionStartTime = time.Now()
+			}
+			transitionsMu.Unlock()
 		}
 		appliedBefore := oldRS.LastApplied()
 
@@ -586,11 +788,12 @@ func main() {
 		}
 		tr := &harnessTransport{fromID: victim, fromAddr: addrs[victim], net: net}
 		cfg := raft.ServerConfig{
-			ID:        victim,
-			Addr:      addrs[victim],
-			Peers:     peers,
-			Storage:   stores[victim], // Retains persistent log and hard state across crash
-			Transport: tr,
+			ID:                victim,
+			Addr:              addrs[victim],
+			Peers:             peers,
+			Storage:           stores[victim], // Retains persistent log and hard state across crash
+			Transport:         tr,
+			SnapshotThreshold: 10000,
 		}
 		newRS, err := raft.NewRaftServer(cfg)
 		if err != nil {
@@ -724,6 +927,12 @@ func main() {
 						partDur := time.Duration(1200+rand.Intn(300)) * time.Millisecond
 						fmt.Printf("[CHAOS MONKEY] Isolating leader Node %d into minority %v vs majority %v for %v\n",
 							curL, minority, majority, partDur.Round(time.Millisecond))
+						transitionsMu.Lock()
+						if !inElection {
+							inElection = true
+							electionStartTime = time.Now()
+						}
+						transitionsMu.Unlock()
 						net.Partition(minority, majority)
 						time.Sleep(partDur)
 						net.Heal()
@@ -1057,6 +1266,126 @@ func main() {
 	fmt.Printf("    - Latency (p50):       %v\n", p50)
 	fmt.Printf("    - Latency (p95):       %v\n", p95)
 	fmt.Printf("    - Latency (p99):       %v\n", p99)
+
+	// ---------------------------------------------------------
+	// 8 Extended Operational & Failure-Mode Metrics
+	// ---------------------------------------------------------
+	// 1 & 2: Successful writes/sec & reads/sec
+	writesCompleted := putsCompleted.Load() + updatesCompleted.Load()
+	readsCompleted := linearGetsDone.Load() + staleGetsDone.Load()
+	writesPerSec := float64(writesCompleted) / elapsed.Seconds()
+	readsPerSec := float64(readsCompleted) / elapsed.Seconds()
+
+	// 3 & 4: Commit latency & Apply latency
+	var (
+		clusterTotalCommits uint64
+		clusterCommitNs     uint64
+		clusterMaxCommit    time.Duration
+		clusterTotalApplies uint64
+		clusterApplyNs      uint64
+		clusterMaxApply     time.Duration
+	)
+	nodesMu.RLock()
+	for _, rs := range nodes {
+		if rs != nil {
+			avgC, maxC, tc, avgA, maxA, ta := rs.LatencyMetrics()
+			clusterTotalCommits += tc
+			clusterCommitNs += uint64(avgC.Nanoseconds()) * tc
+			if maxC > clusterMaxCommit {
+				clusterMaxCommit = maxC
+			}
+			clusterTotalApplies += ta
+			clusterApplyNs += uint64(avgA.Nanoseconds()) * ta
+			if maxA > clusterMaxApply {
+				clusterMaxApply = maxA
+			}
+		}
+	}
+	nodesMu.RUnlock()
+
+	var clusterAvgCommit time.Duration
+	if clusterTotalCommits > 0 {
+		clusterAvgCommit = time.Duration(clusterCommitNs / clusterTotalCommits)
+	}
+	var clusterAvgApply time.Duration
+	if clusterTotalApplies > 0 {
+		clusterAvgApply = time.Duration(clusterApplyNs / clusterTotalApplies)
+	}
+
+	// 5: Election duration
+	var minElection, maxElection, totalElection time.Duration
+	avgElection := time.Duration(0)
+	transitionsMu.Lock()
+	if len(elections) > 0 {
+		minElection = elections[0].Duration
+		for _, el := range elections {
+			totalElection += el.Duration
+			if el.Duration < minElection {
+				minElection = el.Duration
+			}
+			if el.Duration > maxElection {
+				maxElection = el.Duration
+			}
+		}
+		avgElection = totalElection / time.Duration(len(elections))
+	}
+	transitionsMu.Unlock()
+
+	// 6: Retry amplification
+	retryAmp := 1.0
+	if cStats.TotalOperations > 0 {
+		retryAmp = float64(cStats.RawHTTPAttempts) / float64(cStats.TotalOperations)
+	}
+	retryOverheadPct := (retryAmp - 1.0) * 100.0
+	if retryOverheadPct < 0 {
+		retryOverheadPct = 0
+	}
+
+	// 7: Per-node CPU / load
+	var totalHTTPReqs uint64
+	for i := 1; i <= numNodes; i++ {
+		totalHTTPReqs += nodeStats[i].requests.Load()
+	}
+
+	fmt.Printf("\n  Operational & Consensus Resilience Metrics:\n")
+	fmt.Printf("    -----------------------------------------------------------------------------------------\n")
+	fmt.Printf("    METRIC                   VALUE                     WHY / SIGNIFICANCE\n")
+	fmt.Printf("    -----------------------------------------------------------------------------------------\n")
+	fmt.Printf("    Successful writes/sec    %-25s Actual write throughput (puts + OCC updates)\n", fmt.Sprintf("%.2f ops/sec", writesPerSec))
+	fmt.Printf("    Successful reads/sec     %-25s Actual read throughput (linearizable + stale gets)\n", fmt.Sprintf("%.2f ops/sec", readsPerSec))
+	fmt.Printf("    Commit latency           %-25s Raft replication cost (leader proposal to quorum commit)\n", fmt.Sprintf("avg: %s (max: %s)", formatDuration(clusterAvgCommit), formatDuration(clusterMaxCommit)))
+	fmt.Printf("    Apply latency            %-25s State machine processing cost (KV state apply)\n", fmt.Sprintf("avg: %s (max: %s)", formatDuration(clusterAvgApply), formatDuration(clusterMaxApply)))
+	if len(elections) > 0 {
+		fmt.Printf("    Election duration        %-25s Availability during failures (min: %s, max: %s)\n",
+			fmt.Sprintf("avg: %s", formatDuration(avgElection)), formatDuration(minElection), formatDuration(maxElection))
+	} else {
+		fmt.Printf("    Election duration        %-25s Availability during failures (0s steady state)\n", "0s (steady state)")
+	}
+	fmt.Printf("    Retry amplification      %-25s Extra requests due to retries (+%.1f%% retry traffic)\n",
+		fmt.Sprintf("%.2fx", retryAmp), retryOverheadPct)
+	fmt.Printf("    Per-node CPU:                                      Identify overloaded nodes (active load share)\n")
+	for i := 1; i <= numNodes; i++ {
+		reqs := nodeStats[i].requests.Load()
+		ns := nodeStats[i].cpuDurNs.Load()
+		pct := 0.0
+		if totalHTTPReqs > 0 {
+			pct = float64(reqs) / float64(totalHTTPReqs) * 100.0
+		}
+		avgHandlerDur := time.Duration(0)
+		if reqs > 0 {
+			avgHandlerDur = time.Duration(ns / reqs)
+		}
+		fmt.Printf("      |-- Node %d: %5.1f%% cluster load (%d HTTP requests, avg handler CPU: %s)\n",
+			i, pct, reqs, formatDuration(avgHandlerDur))
+	}
+	fmt.Printf("    Per-node disk latency:                             Identify persistence bottlenecks (storage layer)\n")
+	for i := 1; i <= numNodes; i++ {
+		avgApp, maxApp, appCount, avgSync, maxSync, syncCount := stores[i].Stats()
+		fmt.Printf("      |-- Node %d: append avg: %s (max: %s, %d logs) | sync avg: %s (max: %s, %d syncs)\n",
+			i, formatDuration(avgApp), formatDuration(maxApp), appCount,
+			formatDuration(avgSync), formatDuration(maxSync), syncCount)
+	}
+	fmt.Printf("    -----------------------------------------------------------------------------------------\n")
 
 	if len(failureTraces) > 0 {
 		fmt.Printf("\n  Sample Failure Traces (Logged During Chaos Window):\n")

@@ -1,29 +1,40 @@
 package client
 
 import (
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
-const endpointCooldownDuration = 2 * time.Second
+const endpointCooldownDuration = 500 * time.Millisecond
 
 type endpointStatus struct {
-	addr       string
-	unhealthyUntil time.Time
+	addr                 string
+	unhealthyUntilUnixNano atomic.Int64
 }
 
 // endpointPool manages endpoint rotation, fair load balancing, and failure cooldowns.
+// All operations are 100% lock-free for maximum concurrent throughput.
 type endpointPool struct {
-	mu        sync.RWMutex
-	endpoints []endpointStatus
+	endpoints []*endpointStatus
 	rrIndex   uint64
 }
 
+func normalizeEndpoint(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if strings.HasPrefix(addr, "kairo://") {
+		return "http://" + strings.TrimPrefix(addr, "kairo://")
+	}
+	if strings.HasPrefix(addr, "kairos://") {
+		return "https://" + strings.TrimPrefix(addr, "kairos://")
+	}
+	return addr
+}
+
 func newEndpointPool(addrs []string) *endpointPool {
-	eps := make([]endpointStatus, len(addrs))
+	eps := make([]*endpointStatus, len(addrs))
 	for i, a := range addrs {
-		eps[i] = endpointStatus{addr: a}
+		eps[i] = &endpointStatus{addr: normalizeEndpoint(a)}
 	}
 	return &endpointPool{
 		endpoints: eps,
@@ -33,21 +44,18 @@ func newEndpointPool(addrs []string) *endpointPool {
 // Pick returns the next healthy endpoint URL according to round-robin rotation.
 // If all endpoints are currently in cooldown, it returns the next round-robin endpoint anyway.
 func (p *endpointPool) Pick() (string, int) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
 	n := len(p.endpoints)
 	if n == 0 {
 		return "", -1
 	}
 
 	start := int(atomic.AddUint64(&p.rrIndex, 1) % uint64(n))
-	now := time.Now()
+	nowNano := time.Now().UnixNano()
 
 	// 1. Try to find a healthy endpoint
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if now.After(p.endpoints[idx].unhealthyUntil) {
+		if nowNano > p.endpoints[idx].unhealthyUntilUnixNano.Load() {
 			return p.endpoints[idx].addr, idx
 		}
 	}
@@ -58,19 +66,21 @@ func (p *endpointPool) Pick() (string, int) {
 
 // AllHealthy returns all currently healthy endpoints (used by Watch reconnects).
 func (p *endpointPool) AllHealthy() []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	n := len(p.endpoints)
+	if n == 0 {
+		return nil
+	}
 
-	now := time.Now()
+	nowNano := time.Now().UnixNano()
 	var healthy []string
 	for _, ep := range p.endpoints {
-		if now.After(ep.unhealthyUntil) {
+		if nowNano > ep.unhealthyUntilUnixNano.Load() {
 			healthy = append(healthy, ep.addr)
 		}
 	}
 	if len(healthy) == 0 {
 		// Fallback to all if none healthy
-		all := make([]string, len(p.endpoints))
+		all := make([]string, n)
 		for i, ep := range p.endpoints {
 			all[i] = ep.addr
 		}
@@ -81,20 +91,14 @@ func (p *endpointPool) AllHealthy() []string {
 
 // MarkFailed marks the endpoint at index as temporarily unhealthy.
 func (p *endpointPool) MarkFailed(idx int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if idx >= 0 && idx < len(p.endpoints) {
-		p.endpoints[idx].unhealthyUntil = time.Now().Add(endpointCooldownDuration)
+		p.endpoints[idx].unhealthyUntilUnixNano.Store(time.Now().Add(endpointCooldownDuration).UnixNano())
 	}
 }
 
 // MarkSuccess clears any unhealthy cooldown for the endpoint at index.
 func (p *endpointPool) MarkSuccess(idx int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if idx >= 0 && idx < len(p.endpoints) {
-		p.endpoints[idx].unhealthyUntil = time.Time{}
+		p.endpoints[idx].unhealthyUntilUnixNano.Store(0)
 	}
 }

@@ -24,6 +24,11 @@ type proposalResult struct {
 	err  error
 }
 
+type proposalState struct {
+	ch         chan proposalResult
+	submitTime time.Time
+}
+
 type readIndexResponse struct {
 	readIndex uint64
 	err       error
@@ -49,8 +54,9 @@ type ServerConfig struct {
 	Storage           storage.Storage
 	Transport         transport.Transport
 	KVStore           *state.KVStore
-	SnapshotThreshold uint64 // Number of entries before triggering compaction; 0 defaults to 100
-	DisablePreVote    bool   // If true, disables the Raft §9.6 Pre-Vote protocol (defaults to false / enabled)
+	SnapshotThreshold uint64        // Number of entries before triggering compaction; 0 defaults to 100
+	ProposeTimeout    time.Duration // Max duration for proposals/linearizable reads before returning ErrTimeout (defaults to 500ms)
+	DisablePreVote    bool          // If true, disables the Raft §9.6 Pre-Vote protocol (defaults to false / enabled)
 }
 
 // RaftServer coordinates I/O (disk persistence and network transport)
@@ -67,6 +73,7 @@ type RaftServer struct {
 	kv        *state.KVStore
 
 	snapshotThreshold uint64
+	proposeTimeout    time.Duration
 	lastSnapshotIndex uint64
 	lastApplied       uint64
 
@@ -75,8 +82,16 @@ type RaftServer struct {
 	pendingVotes map[int]chan transport.RequestVoteReply
 	pendingApps  map[int]chan transport.AppendEntriesReply
 	pendingSnaps map[int]chan transport.InstallSnapshotReply
-	proposals    map[string]chan proposalResult
+	proposals    map[string]*proposalState
 	reqSeq       uint64
+
+	// Internal consensus latency metrics
+	totalCommits    atomic.Uint64
+	commitLatencyNs atomic.Uint64
+	maxCommitNs     atomic.Uint64
+	totalApplies    atomic.Uint64
+	applyLatencyNs  atomic.Uint64
+	maxApplyNs      atomic.Uint64
 
 	// ReadIndex tracking for linearizable reads (Raft §8, Ongaro §6.4)
 	pendingReads map[string]chan readIndexResponse
@@ -176,6 +191,11 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		threshold = 100
 	}
 
+	proposeTimeout := cfg.ProposeTimeout
+	if proposeTimeout <= 0 {
+		proposeTimeout = 500 * time.Millisecond
+	}
+
 	allPeers := make(map[int]string, len(cfg.Peers)+len(cfg.Learners))
 	for pid, paddr := range cfg.Peers {
 		allPeers[pid] = paddr
@@ -193,12 +213,13 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		transport:         tr,
 		kv:                kv,
 		snapshotThreshold: threshold,
+		proposeTimeout:    proposeTimeout,
 		lastSnapshotIndex: snapIdx,
 		lastApplied:       snapIdx,
 		pendingVotes:      make(map[int]chan transport.RequestVoteReply),
 		pendingApps:       make(map[int]chan transport.AppendEntriesReply),
 		pendingSnaps:      make(map[int]chan transport.InstallSnapshotReply),
-		proposals:         make(map[string]chan proposalResult),
+		proposals:         make(map[string]*proposalState),
 		pendingReads:      make(map[string]chan readIndexResponse),
 		peerChans:         make(map[int]chan Message),
 		stopCh:            make(chan struct{}),
@@ -237,9 +258,9 @@ func (s *RaftServer) run() {
 				if rd.SoftState.Role != state.Leader {
 					// Drop waiting proposals and reads if node lost leadership
 					s.mu.Lock()
-					for k, ch := range s.proposals {
+					for k, prop := range s.proposals {
 						delete(s.proposals, k)
-						ch <- proposalResult{err: ErrNotLeader}
+						prop.ch <- proposalResult{err: ErrNotLeader}
 					}
 					for k, ch := range s.pendingReads {
 						delete(s.pendingReads, k)
@@ -350,7 +371,18 @@ func (s *RaftServer) run() {
 						toNotify = append(toNotify, appliedNotif{reqKey: reqKey, err: applyErr})
 					}
 				} else if len(entry.Data) > 0 {
+					tApply := time.Now()
 					item, applyErr := s.kv.Apply(entry.Data)
+					applyDur := time.Since(tApply)
+					applyNs := uint64(applyDur.Nanoseconds())
+					s.applyLatencyNs.Add(applyNs)
+					s.totalApplies.Add(1)
+					for {
+						cur := s.maxApplyNs.Load()
+						if applyNs <= cur || s.maxApplyNs.CompareAndSwap(cur, applyNs) {
+							break
+						}
+					}
 					atomic.StoreUint64(&s.lastApplied, entry.Index)
 
 					var cmd state.Command
@@ -366,9 +398,21 @@ func (s *RaftServer) run() {
 			if len(toNotify) > 0 {
 				s.mu.Lock()
 				for _, notif := range toNotify {
-					if ch, ok := s.proposals[notif.reqKey]; ok {
+					if prop, ok := s.proposals[notif.reqKey]; ok {
 						delete(s.proposals, notif.reqKey)
-						ch <- proposalResult{item: notif.item, err: notif.err}
+						if !prop.submitTime.IsZero() {
+							commitDur := time.Since(prop.submitTime)
+							commitNs := uint64(commitDur.Nanoseconds())
+							s.commitLatencyNs.Add(commitNs)
+							s.totalCommits.Add(1)
+							for {
+								cur := s.maxCommitNs.Load()
+								if commitNs <= cur || s.maxCommitNs.CompareAndSwap(cur, commitNs) {
+									break
+								}
+							}
+						}
+						prop.ch <- proposalResult{item: notif.item, err: notif.err}
 					}
 				}
 				s.mu.Unlock()
@@ -469,21 +513,22 @@ func (s *RaftServer) maybeCompact() error {
 func (s *RaftServer) handleOutboundMessage(msg Message) {
 	// If message is a reply to a pending incoming RPC, unblock the RPC handler
 	s.mu.Lock()
-	if msg.Type == MsgVoteResp || msg.Type == MsgPreVoteResp {
+	switch msg.Type {
+	case MsgVoteResp, MsgPreVoteResp:
 		if ch, ok := s.pendingVotes[msg.To]; ok {
 			delete(s.pendingVotes, msg.To)
 			s.mu.Unlock()
 			ch <- transport.RequestVoteReply{Term: msg.Term, VoteGranted: !msg.Reject}
 			return
 		}
-	} else if msg.Type == MsgAppResp {
+	case MsgAppResp:
 		if ch, ok := s.pendingApps[msg.To]; ok {
 			delete(s.pendingApps, msg.To)
 			s.mu.Unlock()
 			ch <- transport.AppendEntriesReply{Term: msg.Term, Success: !msg.Reject, MatchIndex: msg.Index}
 			return
 		}
-	} else if msg.Type == MsgSnapResp {
+	case MsgSnapResp:
 		if ch, ok := s.pendingSnaps[msg.To]; ok {
 			delete(s.pendingSnaps, msg.To)
 			s.mu.Unlock()
@@ -503,7 +548,7 @@ func (s *RaftServer) handleOutboundMessage(msg Message) {
 	}
 }
 
-func (s *RaftServer) peerSender(peerID int, addr string, ch chan Message) {
+func (s *RaftServer) peerSender(_ int, addr string, ch chan Message) {
 	defer s.wg.Done()
 	for {
 		select {
@@ -798,7 +843,7 @@ func (s *RaftServer) InstallSnapshot(args *transport.InstallSnapshotArgs, reply 
 
 // Propose submits a state machine command and blocks until linearizable quorum commitment.
 func (s *RaftServer) Propose(cmd state.Command) (state.Item, error) {
-	return s.ProposeWithTimeout(cmd, 3*time.Second)
+	return s.ProposeWithTimeout(cmd, s.proposeTimeout)
 }
 
 // ProposeWithTimeout submits a state machine command with a caller-specified timeout.
@@ -815,7 +860,7 @@ func (s *RaftServer) ProposeWithTimeout(cmd state.Command, timeout time.Duration
 	}
 	reqKey := fmt.Sprintf("%s:%d", cmd.ClientID, cmd.SequenceNum)
 	ch := make(chan proposalResult, 1)
-	s.proposals[reqKey] = ch
+	s.proposals[reqKey] = &proposalState{ch: ch, submitTime: time.Now()}
 	s.mu.Unlock()
 
 	data, err := json.Marshal(cmd)
@@ -875,7 +920,7 @@ func (s *RaftServer) Get(key string) (state.Item, error) {
 // It confirms leadership with a quorum of peers without writing to disk or appending to the log,
 // waits until preceding writes are applied to the state machine, and returns the current value.
 func (s *RaftServer) LinearizableGet(key string) (state.Item, error) {
-	return s.LinearizableGetWithTimeout(key, 3*time.Second)
+	return s.LinearizableGetWithTimeout(key, s.proposeTimeout)
 }
 
 // LinearizableReadIndex executes a ReadIndex request through Raft consensus,
@@ -1046,7 +1091,7 @@ func (s *RaftServer) ClientForward(args *transport.ClientForwardArgs, reply *tra
 		return nil
 
 	case "READ_INDEX":
-		readIndex, err := s.LinearizableReadIndex(3 * time.Second)
+		readIndex, err := s.LinearizableReadIndex(s.proposeTimeout)
 		if err != nil {
 			reply.Error = err.Error()
 			return err
@@ -1186,10 +1231,10 @@ func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, er
 	}
 
 	// 2 & 3. Follower waits for local catch-up up to ReadIndex and reads from its own state machine!
-	return s.waitAppliedAndGet(key, reply.ReadIndex, 3*time.Second)
+	return s.waitAppliedAndGet(key, reply.ReadIndex, s.proposeTimeout)
 }
 
-func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, confState storage.ConfState) {
+func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, _ storage.ConfState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1236,7 +1281,7 @@ func (s *RaftServer) ProposeConfChange(ctx context.Context, cc storage.ConfChang
 
 	ch := make(chan proposalResult, 1)
 	s.mu.Lock()
-	s.proposals[reqKey] = ch
+	s.proposals[reqKey] = &proposalState{ch: ch, submitTime: time.Now()}
 	s.mu.Unlock()
 
 	if err := s.node.ProposeConfChange(cc); err != nil {
@@ -1339,6 +1384,24 @@ func (s *RaftServer) Watch(ctx context.Context, key string, prefix bool, sinceRe
 	}()
 
 	return w.Events, replayed, cancel, nil
+}
+
+// LatencyMetrics returns average commit latency, max commit latency, total commits,
+// and average apply latency, max apply latency, and total applies.
+func (s *RaftServer) LatencyMetrics() (avgCommit, maxCommit time.Duration, totalCommits uint64, avgApply, maxApply time.Duration, totalApplies uint64) {
+	tc := s.totalCommits.Load()
+	if tc > 0 {
+		avgCommit = time.Duration(s.commitLatencyNs.Load() / tc)
+	}
+	maxCommit = time.Duration(s.maxCommitNs.Load())
+
+	ta := s.totalApplies.Load()
+	if ta > 0 {
+		avgApply = time.Duration(s.applyLatencyNs.Load() / ta)
+	}
+	maxApply = time.Duration(s.maxApplyNs.Load())
+
+	return avgCommit, maxCommit, tc, avgApply, maxApply, ta
 }
 
 // Stop gracefully shuts down the server, node loop, and transports.

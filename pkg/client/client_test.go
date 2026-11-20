@@ -631,9 +631,7 @@ func TestClient5xxCircuitBreaking(t *testing.T) {
 		// If all endpoints are failed, AllHealthy falls back to all
 	}
 	// Verify Pick chooses it but marked failed
-	cli.pool.mu.RLock()
-	isUnhealthy := time.Now().Before(cli.pool.endpoints[0].unhealthyUntil)
-	cli.pool.mu.RUnlock()
+	isUnhealthy := time.Now().UnixNano() < cli.pool.endpoints[0].unhealthyUntilUnixNano.Load()
 	if !isUnhealthy {
 		t.Fatalf("expected 500 status code to mark endpoint in cooldown")
 	}
@@ -710,5 +708,67 @@ func TestWatchStreamParserEdgeCases(t *testing.T) {
 	}
 	if time.Since(start) > 1500*time.Millisecond {
 		t.Fatalf("Close took too long to terminate stream")
+	}
+}
+
+func TestKairoConnectionStringParsing(t *testing.T) {
+	tests := []struct {
+		name         string
+		endpoint     string
+		wantEndpoint string
+		wantUser     string
+		wantPass     string
+	}{
+		{
+			name:         "full connection string with user and pass",
+			endpoint:     "kairo://admin:secret123@localhost:8999",
+			wantEndpoint: "http://localhost:8999",
+			wantUser:     "admin",
+			wantPass:     "secret123",
+		},
+		{
+			name:         "connection string with user only",
+			endpoint:     "kairo://alice@127.0.0.1:8999",
+			wantEndpoint: "http://127.0.0.1:8999",
+			wantUser:     "alice",
+			wantPass:     "",
+		},
+		{
+			name:         "connection string with default port auto-appended",
+			endpoint:     "kairo://myhost",
+			wantEndpoint: "http://myhost:8999",
+			wantUser:     "kairo",
+			wantPass:     "kairo-secret",
+		},
+		{
+			name:         "secure kairos scheme with credentials",
+			endpoint:     "kairos://root:toor@kairo-proxy.prod:9443",
+			wantEndpoint: "https://kairo-proxy.prod:9443",
+			wantUser:     "root",
+			wantPass:     "toor",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Endpoints: []string{tc.endpoint},
+			}
+			if err := cfg.setDefaultsAndValidate(); err != nil {
+				t.Fatalf("setDefaultsAndValidate failed: %v", err)
+			}
+			if len(cfg.Endpoints) != 1 || cfg.Endpoints[0] != tc.wantEndpoint {
+				t.Errorf("got endpoint %q, want %q", cfg.Endpoints[0], tc.wantEndpoint)
+			}
+			if cfg.Username != tc.wantUser {
+				t.Errorf("got username %q, want %q", cfg.Username, tc.wantUser)
+			}
+			if cfg.Password != tc.wantPass {
+				t.Errorf("got password %q, want %q", cfg.Password, tc.wantPass)
+			}
+			if cfg.Protocol != "kairo/1.0" {
+				t.Errorf("got protocol %q, want kairo/1.0", cfg.Protocol)
+			}
+		})
 	}
 }

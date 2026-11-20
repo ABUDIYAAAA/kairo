@@ -15,6 +15,8 @@ type Config struct {
 	PollInterval time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	AuthUser     string
+	AuthPassword string
 }
 
 // DefaultConfig returns recommended settings for the proxy.
@@ -41,12 +43,12 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, errors.New("at least one cluster seed endpoint is required")
 	}
 
-	tracker, err := NewClusterTracker(cfg.Endpoints, cfg.PollInterval)
+	tracker, err := NewClusterTracker(cfg.Endpoints, cfg.PollInterval, cfg.AuthUser, cfg.AuthPassword)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cluster tracker: %w", err)
 	}
 
-	router := NewRouter(tracker)
+	router := NewRouter(tracker, cfg.AuthUser, cfg.AuthPassword)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,

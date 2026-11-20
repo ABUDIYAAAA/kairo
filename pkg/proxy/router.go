@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,24 +14,48 @@ import (
 
 // Router handles path-based L7 routing across the Kairo cluster.
 type Router struct {
-	tracker *ClusterTracker
+	tracker      *ClusterTracker
+	authUser     string
+	authPassword string
 }
 
-// NewRouter creates a new L7 reverse proxy router.
-func NewRouter(tracker *ClusterTracker) *Router {
+// NewRouter creates a new L7 reverse proxy router with auth credentials (defaults to kairo / kairo-secret).
+func NewRouter(tracker *ClusterTracker, auth ...string) *Router {
+	user := "kairo"
+	pass := "kairo-secret"
+	if len(auth) > 0 && auth[0] != "" {
+		user = auth[0]
+	}
+	if len(auth) > 1 && auth[1] != "" {
+		pass = auth[1]
+	}
 	return &Router{
-		tracker: tracker,
+		tracker:      tracker,
+		authUser:     user,
+		authPassword: pass,
 	}
 }
 
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Kairo-Protocol", "kairo/1.0")
+
 	path := r.URL.Path
 
-	// Health and proxy internal inspection endpoints
+	// Health and proxy internal inspection endpoints bypass auth
 	if path == "/healthz" || path == "/livez" || path == "/proxy/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
+	// Simple Auth verification (Always enabled)
+	user, pass, ok := r.BasicAuth()
+	if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(rt.authUser)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(rt.authPassword)) != 1 {
+		w.Header().Set("WWW-Authenticate", `Basic realm="kairo"`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized: invalid kairo credentials"}`))
 		return
 	}
 	if path == "/proxy/status" || path == "/proxy/nodes" {
@@ -175,6 +200,7 @@ func (rt *Router) proxyToNode(w http.ResponseWriter, r *http.Request, node *Node
 
 func (rt *Router) createProxyForNode(node *Node, errorHandler func(http.ResponseWriter, *http.Request, error)) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(node.URL)
+	proxy.Transport = upstreamTransport
 	proxy.FlushInterval = -1
 	proxy.ErrorHandler = errorHandler
 	origDirector := proxy.Director
@@ -186,7 +212,7 @@ func (rt *Router) createProxyForNode(node *Node, errorHandler func(http.Response
 	return proxy
 }
 
-func (rt *Router) handleProxyStatus(w http.ResponseWriter, r *http.Request) {
+func (rt *Router) handleProxyStatus(w http.ResponseWriter, _ *http.Request) {
 	nodes := rt.tracker.Nodes()
 	type nodeInfo struct {
 		ID            int       `json:"id"`
