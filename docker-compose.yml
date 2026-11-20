@@ -1,0 +1,199 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Node 1
+  # ---------------------------------------------------------------------------
+  kairo-1:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kairo-1
+    hostname: kairo-1
+    restart: unless-stopped
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+      - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
+    ports:
+      - "${KAIRO_NODE1_PORT:-9001}:9000"
+    volumes:
+      - kairo-data-1:/data
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Node 2
+  # ---------------------------------------------------------------------------
+  kairo-2:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kairo-2
+    hostname: kairo-2
+    restart: unless-stopped
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+      - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
+    ports:
+      - "${KAIRO_NODE2_PORT:-9002}:9000"
+    volumes:
+      - kairo-data-2:/data
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Node 3
+  # ---------------------------------------------------------------------------
+  kairo-3:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kairo-3
+    hostname: kairo-3
+    restart: unless-stopped
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+      - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
+    ports:
+      - "${KAIRO_NODE3_PORT:-9003}:9000"
+    volumes:
+      - kairo-data-3:/data
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Node 4 (Optional 5-node cluster profile)
+  # ---------------------------------------------------------------------------
+  kairo-4:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kairo-4
+    hostname: kairo-4
+    restart: unless-stopped
+    profiles: ["5-node", "all"]
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-5}
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+      - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
+    ports:
+      - "${KAIRO_NODE4_PORT:-9004}:9000"
+    volumes:
+      - kairo-data-4:/data
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Node 5 (Optional 5-node cluster profile)
+  # ---------------------------------------------------------------------------
+  kairo-5:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kairo-5
+    hostname: kairo-5
+    restart: unless-stopped
+    profiles: ["5-node", "all"]
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-5}
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+      - KAIRO_PRE_VOTE=${KAIRO_PRE_VOTE:-true}
+    ports:
+      - "${KAIRO_NODE5_PORT:-9005}:9000"
+    volumes:
+      - kairo-data-5:/data
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # ---------------------------------------------------------------------------
+  # Kairo L7 Cluster Proxy (Load balances reads, routes writes to Raft leader)
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: ${KAIRO_IMAGE:-kairo:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["kairo-proxy"]
+    container_name: kairo-proxy
+    hostname: kairo-proxy
+    restart: unless-stopped
+    environment:
+      - KAIRO_CLUSTER_SIZE=${KAIRO_CLUSTER_SIZE:-3}
+      - KAIRO_PROXY_LISTEN=:8999
+      - KAIRO_LOG_LEVEL=${KAIRO_LOG_LEVEL:-info}
+      - KAIRO_LOG_FORMAT=${KAIRO_LOG_FORMAT:-text}
+    ports:
+      - "${KAIRO_PROXY_PORT:-8999}:8999"
+    depends_on:
+      kairo-1:
+        condition: service_healthy
+      kairo-2:
+        condition: service_healthy
+      kairo-3:
+        condition: service_healthy
+    networks:
+      - kairo-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8999/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+networks:
+  kairo-net:
+    driver: bridge
+    name: kairo-net
+
+volumes:
+  kairo-data-1:
+    name: kairo-data-1
+  kairo-data-2:
+    name: kairo-data-2
+  kairo-data-3:
+    name: kairo-data-3
+  kairo-data-4:
+    name: kairo-data-4
+  kairo-data-5:
+    name: kairo-data-5

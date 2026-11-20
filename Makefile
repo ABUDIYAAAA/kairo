@@ -1,4 +1,4 @@
-.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos build-proxy run-proxy
+.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos build-proxy run-proxy docker-build docker-up docker-down docker-status docker-logs test-containers
 
 BUILD_DIR := bin
 BINARY := $(BUILD_DIR)/kairo
@@ -105,3 +105,25 @@ build-proxy:
 # Run Cluster Proxy router in foreground
 run-proxy: build-proxy
 	$(PROXY_BINARY) -listen=$(PROXY_LISTEN) -endpoints=$(PROXY_ENDPOINTS)
+
+# Docker targets
+IMAGE_TAG ?= kairo:latest
+
+docker-build:
+	docker build -t $(IMAGE_TAG) .
+
+docker-up:
+	docker compose up -d
+
+docker-down:
+	docker compose down
+
+docker-status:
+	docker compose ps
+
+docker-logs:
+	docker compose logs -f
+
+# Testcontainers end-to-end integration & chaos suite
+test-containers: docker-build
+	go test -v -count=1 -run "TestContainer" ./tests

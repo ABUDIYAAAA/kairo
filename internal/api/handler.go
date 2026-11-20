@@ -16,6 +16,16 @@ import (
 func NewHandler(rs *raft.RaftServer) http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{

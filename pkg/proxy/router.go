@@ -26,7 +26,13 @@ func NewRouter(tracker *ClusterTracker) *Router {
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// Proxy internal inspection endpoints
+	// Health and proxy internal inspection endpoints
+	if path == "/healthz" || path == "/livez" || path == "/proxy/healthz" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
 	if path == "/proxy/status" || path == "/proxy/nodes" {
 		rt.handleProxyStatus(w, r)
 		return

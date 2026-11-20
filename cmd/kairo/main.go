@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -85,55 +86,76 @@ func startClientHTTP(addr string, rs *raft.RaftServer) *http.Server {
 }
 
 func main() {
-	nodeID := flag.Int("id", 1, "Unique Node ID (e.g. 1, 2, 3)")
-	addr := flag.String("addr", "127.0.0.1:8001", "Internal Raft peer address to listen on (host:port)")
-	clientAddr := flag.String("client-addr", "127.0.0.1:9001", "Outside client port/address for HTTP KV traffic")
-	peersStr := flag.String("peers", "", "Comma-separated peer mappings (e.g. '2=127.0.0.1:8002,3=127.0.0.1:8003')")
-	dataDir := flag.String("data-dir", "", "Persistent storage directory for Raft log and hard state")
-	logLevel := flag.String("log-level", "info", "Logging level: debug, info, warn, error")
-	logFormat := flag.String("log-format", "text", "Logging format: text, json")
+	if len(os.Args) > 1 && (os.Args[1] == "proxy" || os.Args[1] == "kairo-proxy") {
+		if p, err := exec.LookPath("kairo-proxy"); err == nil {
+			_ = syscall.Exec(p, append([]string{"kairo-proxy"}, os.Args[2:]...), os.Environ())
+		}
+	}
+	if os.Getenv("KAIRO_MODE") == "proxy" {
+		if p, err := exec.LookPath("kairo-proxy"); err == nil {
+			_ = syscall.Exec(p, append([]string{"kairo-proxy"}, os.Args[1:]...), os.Environ())
+		}
+	}
+
+	nodeID := flag.Int("id", 0, "Unique Node ID (e.g. 1, 2, 3; defaults to KAIRO_ID or trailing digits in hostname)")
+	addr := flag.String("addr", "", "Internal Raft peer address to listen on (host:port; defaults to KAIRO_ADDR or 0.0.0.0:8000)")
+	clientAddr := flag.String("client-addr", "", "Outside client port/address for HTTP KV traffic (defaults to KAIRO_CLIENT_ADDR or 0.0.0.0:9000)")
+	clusterSize := flag.Int("cluster-size", 0, "Number of nodes in the cluster (e.g. 3, 5; auto-computes peers if unset)")
+	peersStr := flag.String("peers", "", "Comma-separated peer mappings (e.g. '2=kairo-2:8000,3=kairo-3:8000')")
+	peerTemplate := flag.String("peer-template", "", "Template for auto-derived peer addresses (default: 'kairo-%d:8000')")
+	dataDir := flag.String("data-dir", "", "Persistent storage directory for Raft log and hard state (defaults to /data or data/node<id>)")
+	logLevel := flag.String("log-level", "", "Logging level: debug, info, warn, error (default: info)")
+	logFormat := flag.String("log-format", "", "Logging format: text, json (default: text)")
 	preVote := flag.Bool("pre-vote", true, "Enable Pre-Vote protocol (Ongaro §9.6) to prevent election disruptions")
 
 	flag.Parse()
 
-	// 1. Initialize structured logger
-	setupLogger(*logLevel, *logFormat)
-
-	if *dataDir == "" {
-		*dataDir = fmt.Sprintf("data/node%d", *nodeID)
-	}
-
-	peers, err := parsePeers(*peersStr)
+	// 1. Resolve configuration from flags, environment variables, and auto-discovery
+	cfg, err := ResolveConfig(ConfigFlags{
+		ID:           *nodeID,
+		Addr:         *addr,
+		ClientAddr:   *clientAddr,
+		ClusterSize:  *clusterSize,
+		Peers:        *peersStr,
+		PeerTemplate: *peerTemplate,
+		DataDir:      *dataDir,
+		LogLevel:     *logLevel,
+		LogFormat:    *logFormat,
+		PreVote:      *preVote,
+	})
 	if err != nil {
-		slog.Error("error parsing peers", "error", err)
+		fmt.Fprintf(os.Stderr, "failed to resolve configuration: %v\n", err)
 		os.Exit(1)
 	}
 
+	setupLogger(cfg.LogLevel, cfg.LogFormat)
+
 	slog.Info("starting Kairo Raft Node",
-		slog.Int("node_id", *nodeID),
-		slog.String("internal_addr", *addr),
-		slog.String("client_addr", *clientAddr),
-		slog.String("data_dir", *dataDir),
-		slog.Any("peers", peers),
-		slog.String("log_level", *logLevel),
-		slog.String("log_format", *logFormat),
+		slog.Int("node_id", cfg.NodeID),
+		slog.String("internal_addr", cfg.Addr),
+		slog.String("client_addr", cfg.ClientAddr),
+		slog.String("data_dir", cfg.DataDir),
+		slog.Int("cluster_size", cfg.ClusterSize),
+		slog.Any("peers", cfg.Peers),
+		slog.String("log_level", cfg.LogLevel),
+		slog.String("log_format", cfg.LogFormat),
 	)
 
 	// 2. Initialize persistent stable storage
-	store, err := storage.OpenFileStorage(*dataDir)
+	store, err := storage.OpenFileStorage(cfg.DataDir)
 	if err != nil {
-		slog.Error("failed to open stable storage", "dir", *dataDir, "error", err)
+		slog.Error("failed to open stable storage", "dir", cfg.DataDir, "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()
 
 	// 3. Initialize RaftServer (coordinates I/O around pure Raft FSM via Ready batches)
 	serverCfg := raft.ServerConfig{
-		ID:             *nodeID,
-		Addr:           *addr,
-		Peers:          peers,
+		ID:             cfg.NodeID,
+		Addr:           cfg.Addr,
+		Peers:          cfg.Peers,
 		Storage:        store,
-		DisablePreVote: !*preVote,
+		DisablePreVote: !cfg.PreVote,
 	}
 
 	rServer, err := raft.NewRaftServer(serverCfg)
@@ -144,15 +166,15 @@ func main() {
 	defer rServer.Stop()
 
 	// 4. Start internal RPC server
-	srv, err := transport.NewServer(*addr, rServer)
+	srv, err := transport.NewServer(cfg.Addr, rServer)
 	if err != nil {
-		slog.Error("failed to start transport server", "addr", *addr, "error", err)
+		slog.Error("failed to start transport server", "addr", cfg.Addr, "error", err)
 		os.Exit(1)
 	}
 	defer srv.Close()
 
 	// 5. Start HTTP client server for linearizable KV operations
-	httpSrv := startClientHTTP(*clientAddr, rServer)
+	httpSrv := startClientHTTP(cfg.ClientAddr, rServer)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -160,8 +182,8 @@ func main() {
 	}()
 
 	slog.Info("node initialized and running",
-		slog.Int("node_id", *nodeID),
-		slog.String("client_api", *clientAddr),
+		slog.Int("node_id", cfg.NodeID),
+		slog.String("client_api", cfg.ClientAddr),
 	)
 
 	sigCh := make(chan os.Signal, 1)
