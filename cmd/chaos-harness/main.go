@@ -893,101 +893,103 @@ func main() {
 	stopChaosCh := make(chan struct{})
 	var chaosStrikes uint64
 	var chaosWg sync.WaitGroup
-	chaosWg.Add(1)
-	go func() {
-		defer chaosWg.Done()
-		ticker := time.NewTicker(*chaosRateFlag)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopChaosCh:
-				net.Heal()
-				return
-			case <-ticker.C:
-				atomic.AddUint64(&chaosStrikes, 1)
-				r := rand.Intn(5)
-				switch r {
-				case 0:
-					// CRASH LEADER: Keep dead for 1.2s - 1.8s (election timeout is 500ms-1000ms)
-					// This GUARANTEES followers timeout and elect a new leader!
-					curL, _ := getCurrentLeader()
-					if curL > 0 && numNodes >= 3 {
-						offlineDur := time.Duration(1200+rand.Intn(600)) * time.Millisecond
-						crashAndReboot(curL, offlineDur)
-					}
-
-				case 1:
-					// CRASH FOLLOWER: Keep dead for 1.0s - 2.0s
-					curL, _ := getCurrentLeader()
-					var followers []int
-					for id := 1; id <= numNodes; id++ {
-						if id != curL {
-							followers = append(followers, id)
+	if *chaosRateFlag > 0 {
+		chaosWg.Add(1)
+		go func() {
+			defer chaosWg.Done()
+			ticker := time.NewTicker(*chaosRateFlag)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopChaosCh:
+					net.Heal()
+					return
+				case <-ticker.C:
+					atomic.AddUint64(&chaosStrikes, 1)
+					r := rand.Intn(5)
+					switch r {
+					case 0:
+						// CRASH LEADER: Keep dead for 1.2s - 1.8s (election timeout is 500ms-1000ms)
+						// This GUARANTEES followers timeout and elect a new leader!
+						curL, _ := getCurrentLeader()
+						if curL > 0 && numNodes >= 3 {
+							offlineDur := time.Duration(1200+rand.Intn(600)) * time.Millisecond
+							crashAndReboot(curL, offlineDur)
 						}
-					}
-					if len(followers) > 0 {
-						victim := followers[rand.Intn(len(followers))]
-						offlineDur := time.Duration(1000+rand.Intn(1000)) * time.Millisecond
-						crashAndReboot(victim, offlineDur)
-					}
 
-				case 2:
-					// PARTITION LEADER into minority for 1.2s - 1.5s
-					// Exceeds 10-20 ticks (500-1000ms), forcing followers to elect a new leader
-					curL, _ := getCurrentLeader()
-					if curL > 0 && numNodes >= 3 {
-						majoritySize := (numNodes / 2) + 1
-						minoritySize := numNodes - majoritySize
-						minorityMap := map[int]bool{curL: true}
-						minority := []int{curL}
-						for id := 1; id <= numNodes && len(minority) < minoritySize; id++ {
-							if id != curL {
-								minorityMap[id] = true
-								minority = append(minority, id)
-							}
-						}
-						var majority []int
+					case 1:
+						// CRASH FOLLOWER: Keep dead for 1.0s - 2.0s
+						curL, _ := getCurrentLeader()
+						var followers []int
 						for id := 1; id <= numNodes; id++ {
-							if !minorityMap[id] {
-								majority = append(majority, id)
+							if id != curL {
+								followers = append(followers, id)
 							}
 						}
-						partDur := time.Duration(1200+rand.Intn(300)) * time.Millisecond
-						fmt.Printf("[CHAOS MONKEY] Isolating leader Node %d into minority %v vs majority %v for %v\n",
-							curL, minority, majority, partDur.Round(time.Millisecond))
-						transitionsMu.Lock()
-						if !inElection {
-							inElection = true
-							electionStartTime = time.Now()
+						if len(followers) > 0 {
+							victim := followers[rand.Intn(len(followers))]
+							offlineDur := time.Duration(1000+rand.Intn(1000)) * time.Millisecond
+							crashAndReboot(victim, offlineDur)
 						}
-						transitionsMu.Unlock()
-						net.Partition(minority, majority)
-						time.Sleep(partDur)
-						net.Heal()
-						fmt.Printf("[CHAOS MONKEY] Healed partition for Node %d\n", curL)
-					}
 
-				case 3:
-					// 25% packet loss across mesh for 300ms
-					fmt.Printf("[CHAOS MONKEY] Injecting 25%% packet loss across Raft mesh for 300ms\n")
-					net.SetLossRate(0.25)
-					time.Sleep(300 * time.Millisecond)
-					net.SetLossRate(0)
+					case 2:
+						// PARTITION LEADER into minority for 1.2s - 1.5s
+						// Exceeds 10-20 ticks (500-1000ms), forcing followers to elect a new leader
+						curL, _ := getCurrentLeader()
+						if curL > 0 && numNodes >= 3 {
+							majoritySize := (numNodes / 2) + 1
+							minoritySize := numNodes - majoritySize
+							minorityMap := map[int]bool{curL: true}
+							minority := []int{curL}
+							for id := 1; id <= numNodes && len(minority) < minoritySize; id++ {
+								if id != curL {
+									minorityMap[id] = true
+									minority = append(minority, id)
+								}
+							}
+							var majority []int
+							for id := 1; id <= numNodes; id++ {
+								if !minorityMap[id] {
+									majority = append(majority, id)
+								}
+							}
+							partDur := time.Duration(1200+rand.Intn(300)) * time.Millisecond
+							fmt.Printf("[CHAOS MONKEY] Isolating leader Node %d into minority %v vs majority %v for %v\n",
+								curL, minority, majority, partDur.Round(time.Millisecond))
+							transitionsMu.Lock()
+							if !inElection {
+								inElection = true
+								electionStartTime = time.Now()
+							}
+							transitionsMu.Unlock()
+							net.Partition(minority, majority)
+							time.Sleep(partDur)
+							net.Heal()
+							fmt.Printf("[CHAOS MONKEY] Healed partition for Node %d\n", curL)
+						}
 
-				case 4:
-					// Trigger log compaction & snapshot
-					target := rand.Intn(numNodes) + 1
-					nodesMu.RLock()
-					n := nodes[target]
-					nodesMu.RUnlock()
-					if n != nil {
-						fmt.Printf("[CHAOS MONKEY] Triggering log compaction & snapshot on Node %d\n", target)
-						_ = n.Snapshot()
+					case 3:
+						// 25% packet loss across mesh for 300ms
+						fmt.Printf("[CHAOS MONKEY] Injecting 25%% packet loss across Raft mesh for 300ms\n")
+						net.SetLossRate(0.25)
+						time.Sleep(300 * time.Millisecond)
+						net.SetLossRate(0)
+
+					case 4:
+						// Trigger log compaction & snapshot
+						target := rand.Intn(numNodes) + 1
+						nodesMu.RLock()
+						n := nodes[target]
+						nodesMu.RUnlock()
+						if n != nil {
+							fmt.Printf("[CHAOS MONKEY] Triggering log compaction & snapshot on Node %d\n", target)
+							_ = n.Snapshot()
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// 8. Run high-throughput client load
 	fmt.Printf("[*] Generating high-concurrency client load for %v...\n", *durationFlag)

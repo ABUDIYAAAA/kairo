@@ -436,6 +436,7 @@ func (r *Raft) Step(m Message) error {
 				r.unstableEntries = append(r.unstableEntries, newEntry)
 			}
 			r.matchIndex[r.id] = r.lastIndex()
+			r.maybeCommit()
 			r.bcastAppend()
 		}
 
@@ -926,6 +927,8 @@ func (r *Raft) becomeLeader() {
 	r.entries = append(r.entries, noOpEntry)
 	r.unstableEntries = append(r.unstableEntries, noOpEntry)
 	r.matchIndex[r.id] = noOpEntry.Index
+	r.maybeCommit()
+	r.bcastAppend()
 }
 
 func (r *Raft) truncate(fromIndex uint64) {
