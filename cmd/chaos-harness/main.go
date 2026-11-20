@@ -720,7 +720,34 @@ func main() {
 		catchupEvents []catchupEvent
 		crashedMu     sync.Mutex
 		crashedNodes  = make(map[int]bool)
+
+		accumMu           sync.Mutex
+		accumTotalCommits uint64
+		accumCommitNs     uint64
+		accumMaxCommit    time.Duration
+		accumTotalApplies uint64
+		accumApplyNs      uint64
+		accumMaxApply     time.Duration
 	)
+
+	harvestMetrics := func(rs *raft.RaftServer) {
+		if rs == nil {
+			return
+		}
+		avgC, maxC, tc, avgA, maxA, ta := rs.LatencyMetrics()
+		accumMu.Lock()
+		accumTotalCommits += tc
+		accumCommitNs += uint64(avgC.Nanoseconds()) * tc
+		if maxC > accumMaxCommit {
+			accumMaxCommit = maxC
+		}
+		accumTotalApplies += ta
+		accumApplyNs += uint64(avgA.Nanoseconds()) * ta
+		if maxA > accumMaxApply {
+			accumMaxApply = maxA
+		}
+		accumMu.Unlock()
+	}
 
 	crashAndReboot := func(victim int, offlineDuration time.Duration) {
 		crashedMu.Lock()
@@ -764,6 +791,7 @@ func main() {
 		// 1. Crash victim
 		nodeHandlers[victim].SetDown(true)
 		net.Disconnect(victim)
+		harvestMetrics(oldRS)
 		oldRS.Stop()
 
 		// 2. Offline interval: cluster commits client writes without victim
@@ -1119,6 +1147,7 @@ func main() {
 		}
 		if newRS, err := raft.NewRaftServer(cfg); err == nil {
 			nodesMu.Lock()
+			harvestMetrics(nodes[victim])
 			nodes[victim] = newRS
 			nodesMu.Unlock()
 			net.Register(victim, addrs[victim], newRS)
@@ -1277,14 +1306,15 @@ func main() {
 	readsPerSec := float64(readsCompleted) / elapsed.Seconds()
 
 	// 3 & 4: Commit latency & Apply latency
-	var (
-		clusterTotalCommits uint64
-		clusterCommitNs     uint64
-		clusterMaxCommit    time.Duration
-		clusterTotalApplies uint64
-		clusterApplyNs      uint64
-		clusterMaxApply     time.Duration
-	)
+	accumMu.Lock()
+	clusterTotalCommits := accumTotalCommits
+	clusterCommitNs := accumCommitNs
+	clusterMaxCommit := accumMaxCommit
+	clusterTotalApplies := accumTotalApplies
+	clusterApplyNs := accumApplyNs
+	clusterMaxApply := accumMaxApply
+	accumMu.Unlock()
+
 	nodesMu.RLock()
 	for _, rs := range nodes {
 		if rs != nil {
