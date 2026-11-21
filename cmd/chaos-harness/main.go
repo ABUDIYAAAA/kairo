@@ -421,6 +421,7 @@ func main() {
 	retriesFlag := flag.Int("retries", 5, "Number of client-side retry attempts on transient failure (1 = no retries, exposes raw failures)")
 	proxyFlag := flag.Bool("proxy", true, "Route client traffic through Kairo Cluster Proxy with Auth & custom protocol")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose Raft server logging")
+	containersFlag := flag.Bool("containers", false, "Run chaos harness against real Docker containers via testcontainers-go")
 	flag.Parse()
 
 	if !*verboseFlag {
@@ -431,6 +432,15 @@ func main() {
 	if numNodes < 1 {
 		fmt.Printf("Error: number of nodes must be at least 1, got %d\n", numNodes)
 		os.Exit(1)
+	}
+
+	if *containersFlag {
+		targetOps := *targetOpsFlag
+		if targetOps == 10000.0 {
+			targetOps = 500.0 // Adjusted target throughput for real Docker containers
+		}
+		runContainerChaosHarness(numNodes, *durationFlag, *workersFlag, *chaosRateFlag, targetOps, *retriesFlag, *proxyFlag, *verboseFlag)
+		return
 	}
 
 	fmt.Printf("\n[+] Launching Kairo Chaos Harness Benchmark (%d Nodes)\n", numNodes)

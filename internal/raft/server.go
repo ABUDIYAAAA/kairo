@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,18 @@ type readWaitReq struct {
 type readResult struct {
 	item state.Item
 	err  error
+}
+
+// ClusterEvent represents a real-time topology or health change notification.
+type ClusterEvent struct {
+	Type     string            `json:"type"` // "peer_health", "conf_change", "leader_change", "init"
+	NodeID   int               `json:"node_id,omitempty"`
+	Addr     string            `json:"addr,omitempty"`
+	Healthy  bool              `json:"healthy,omitempty"`
+	LeaderID int               `json:"leader_id,omitempty"`
+	Term     uint64            `json:"term,omitempty"`
+	ConfRev  uint64            `json:"conf_rev,omitempty"`
+	Peers    map[string]string `json:"peers,omitempty"`
 }
 
 // ServerConfig configures the Raft cluster node runner.
@@ -100,6 +113,11 @@ type RaftServer struct {
 
 	// Dedicated FIFO worker queues per peer for in-order RPC delivery
 	peerChans map[int]chan Message
+
+	// Leader heartbeat tracking & topology events
+	peerHealth       map[int]bool
+	peerLastSeen     map[int]time.Time
+	eventSubscribers map[chan ClusterEvent]struct{}
 
 	// Throttle logging for periodic heartbeats
 	lastHeartbeatLog time.Time
@@ -222,7 +240,14 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 		proposals:         make(map[string]*proposalState),
 		pendingReads:      make(map[string]chan readIndexResponse),
 		peerChans:         make(map[int]chan Message),
+		peerHealth:        make(map[int]bool),
+		peerLastSeen:      make(map[int]time.Time),
+		eventSubscribers:  make(map[chan ClusterEvent]struct{}),
 		stopCh:            make(chan struct{}),
+	}
+
+	for pid := range allPeers {
+		s.peerHealth[pid] = true
 	}
 
 	for pid, paddr := range allPeers {
@@ -303,6 +328,13 @@ func (s *RaftServer) run() {
 						s.lastLeaderId = rd.SoftState.Lead
 					}
 				}
+
+				s.broadcastClusterEvent(ClusterEvent{
+					Type:     "leader_change",
+					LeaderID: rd.SoftState.Lead,
+					Term:     s.node.Term(),
+					ConfRev:  s.node.ConfRev(),
+				})
 			}
 
 			// 1. Persist HardState synchronously (Raft Figure 2)
@@ -632,6 +664,7 @@ func (s *RaftServer) sendRPC(m Message, addr string) {
 		}
 		var reply transport.AppendEntriesReply
 		if err := s.transport.AppendEntries(addr, &args, &reply); err == nil {
+			s.updatePeerLiveness(m.To, true)
 			_ = s.node.Step(Message{
 				Type:   MsgAppResp,
 				From:   m.To,
@@ -640,6 +673,8 @@ func (s *RaftServer) sendRPC(m Message, addr string) {
 				Reject: !reply.Success,
 				Index:  reply.MatchIndex,
 			})
+		} else {
+			s.updatePeerLiveness(m.To, false)
 		}
 
 	case MsgSnap:
@@ -655,12 +690,15 @@ func (s *RaftServer) sendRPC(m Message, addr string) {
 		}
 		var reply transport.InstallSnapshotReply
 		if err := s.transport.InstallSnapshot(addr, &args, &reply); err == nil {
+			s.updatePeerLiveness(m.To, true)
 			_ = s.node.Step(Message{
 				Type: MsgSnapResp,
 				From: m.To,
 				To:   m.From,
 				Term: reply.Term,
 			})
+		} else {
+			s.updatePeerLiveness(m.To, false)
 		}
 	}
 }
@@ -1236,11 +1274,10 @@ func (s *RaftServer) ExecuteOrForwardLinearizableGet(key string) (state.Item, er
 
 func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, _ storage.ConfState) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	switch cc.Type {
 	case storage.ConfAddLearner:
 		s.peers[cc.NodeID] = cc.Addr
+		s.peerHealth[cc.NodeID] = true
 		if cc.NodeID != s.id {
 			if _, exists := s.peerChans[cc.NodeID]; !exists {
 				ch := make(chan Message, 8192)
@@ -1260,11 +1297,121 @@ func (s *RaftServer) applyConfChangeToServer(cc storage.ConfChange, _ storage.Co
 			delete(s.peerChans, cc.NodeID)
 		}
 		delete(s.peers, cc.NodeID)
+		delete(s.peerHealth, cc.NodeID)
+		delete(s.peerLastSeen, cc.NodeID)
 
 		if cc.NodeID == s.id {
 			slog.Info("node removed from cluster", slog.Int("node_id", s.id))
 		}
 	}
+
+	peersCopy := make(map[string]string, len(s.peers)+1)
+	for id, addr := range s.peers {
+		peersCopy[fmt.Sprintf("%d", id)] = addr
+	}
+	peersCopy[fmt.Sprintf("%d", s.id)] = s.addr
+	leaderID := s.node.raft.lead
+	term := s.node.raft.currentTerm
+	confRev := s.node.raft.confRev
+	s.mu.Unlock()
+
+	s.broadcastClusterEvent(ClusterEvent{
+		Type:     "conf_change",
+		NodeID:   cc.NodeID,
+		Addr:     cc.Addr,
+		LeaderID: leaderID,
+		Term:     term,
+		ConfRev:  confRev,
+		Peers:    peersCopy,
+	})
+}
+
+func (s *RaftServer) updatePeerLiveness(peerID int, healthy bool) {
+	s.mu.Lock()
+	old, exists := s.peerHealth[peerID]
+	s.peerHealth[peerID] = healthy
+	s.peerLastSeen[peerID] = time.Now()
+	addr := s.peers[peerID]
+	leaderID := s.node.raft.lead
+	term := s.node.raft.currentTerm
+	confRev := s.node.raft.confRev
+	s.mu.Unlock()
+
+	if !exists || old != healthy {
+		s.broadcastClusterEvent(ClusterEvent{
+			Type:     "peer_health",
+			NodeID:   peerID,
+			Addr:     addr,
+			Healthy:  healthy,
+			LeaderID: leaderID,
+			Term:     term,
+			ConfRev:  confRev,
+		})
+	}
+}
+
+func (s *RaftServer) broadcastClusterEvent(ev ClusterEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ch := range s.eventSubscribers {
+		select {
+		case ch <- ev:
+		default:
+			// Non-blocking drop if consumer queue full
+		}
+	}
+}
+
+// SubscribeClusterEvents registers a listener for real-time cluster membership and health events.
+func (s *RaftServer) SubscribeClusterEvents() (<-chan ClusterEvent, func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch := make(chan ClusterEvent, 128)
+	if s.eventSubscribers == nil {
+		s.eventSubscribers = make(map[chan ClusterEvent]struct{})
+	}
+	s.eventSubscribers[ch] = struct{}{}
+	unsub := func() {
+		s.mu.Lock()
+		delete(s.eventSubscribers, ch)
+		s.mu.Unlock()
+	}
+	return ch, unsub
+}
+
+// ConfRev returns the current monotonic configuration revision counter.
+func (s *RaftServer) ConfRev() uint64 {
+	return s.node.ConfRev()
+}
+
+// PeerHealth returns a snapshot of peer liveness based on leader heartbeats.
+func (s *RaftServer) PeerHealth() map[int]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res := make(map[int]bool, len(s.peers)+1)
+	res[s.id] = true
+	for id := range s.peers {
+		if h, ok := s.peerHealth[id]; ok {
+			res[id] = h
+		} else {
+			res[id] = true
+		}
+	}
+	return res
+}
+
+// ActivePeersHeader returns a comma-separated list of active, reachable peers (e.g. "1=addr1,2=addr2").
+func (s *RaftServer) ActivePeersHeader() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%d=%s", s.id, s.addr))
+	for id, addr := range s.peers {
+		if h, ok := s.peerHealth[id]; !ok || h {
+			b.WriteString(fmt.Sprintf(",%d=%s", id, addr))
+		}
+	}
+	return b.String()
 }
 
 // ProposeConfChange submits a membership change to the cluster leader and waits for its commitment.

@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,6 +83,10 @@ func NewClusterTracker(endpoints []string, pollInterval time.Duration, auth ...s
 		doneCh: make(chan struct{}),
 	}
 
+	for _, n := range nodes {
+		n.SetMetadataCallback(ct.IngestMetadata)
+	}
+
 	return ct, nil
 }
 
@@ -85,6 +94,9 @@ func NewClusterTracker(endpoints []string, pollInterval time.Duration, auth ...s
 func (ct *ClusterTracker) Start() {
 	// Immediate probe on start
 	ct.pollAll(context.Background())
+
+	// Start real-time leader event stream (heartbeat health + dynamic topology push)
+	go ct.runEventStream()
 
 	go func() {
 		defer close(ct.doneCh)
@@ -158,6 +170,18 @@ func (ct *ClusterTracker) pollNode(ctx context.Context, n *Node) {
 		return
 	}
 
+	// Inspect piggybacked headers from status response
+	leaderIDStr := resp.Header.Get("X-Kairo-Leader-Id")
+	termStr := resp.Header.Get("X-Kairo-Term")
+	confRevStr := resp.Header.Get("X-Kairo-Conf-Rev")
+	activePeers := resp.Header.Get("X-Kairo-Active-Peers")
+	if leaderIDStr != "" || activePeers != "" {
+		leaderID, _ := strconv.Atoi(leaderIDStr)
+		term, _ := strconv.ParseUint(termStr, 10, 64)
+		confRev, _ := strconv.ParseUint(confRevStr, 10, 64)
+		ct.IngestMetadata(leaderID, term, confRev, activePeers)
+	}
+
 	var status StatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 		ct.markUnhealthy(n)
@@ -169,6 +193,239 @@ func (ct *ClusterTracker) pollNode(ctx context.Context, n *Node) {
 
 func (ct *ClusterTracker) markUnhealthy(n *Node) {
 	n.SetHealthy(false)
+}
+
+// IngestMetadata dynamically updates routing state from piggybacked response headers.
+func (ct *ClusterTracker) IngestMetadata(leaderID int, _ uint64, _ uint64, activePeers string) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	// 1. Update leader role if changed
+	if leaderID > 0 {
+		for _, n := range ct.nodes {
+			if n.GetID() == leaderID {
+				n.SetRole("Leader")
+				n.SetHealthy(true)
+			} else if n.GetRole() == "Leader" {
+				n.SetRole("Follower")
+			}
+		}
+	}
+
+	// 2. Parse activePeers if present (e.g. "1=127.0.0.1:8999,2=127.0.0.1:9000")
+	if activePeers != "" {
+		peerItems := strings.Split(activePeers, ",")
+		for _, item := range peerItems {
+			parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			id, err := strconv.Atoi(parts[0])
+			if err != nil || id <= 0 {
+				continue
+			}
+			addr := parts[1]
+
+			var found *Node
+			for _, n := range ct.nodes {
+				if n.GetID() == id || strings.Contains(n.RawAddr, addr) || strings.Contains(addr, n.URL.Host) {
+					found = n
+					break
+				}
+			}
+
+			if found != nil {
+				if found.GetID() <= 0 {
+					found.SetID(id)
+				}
+				found.SetHealthy(true)
+			} else {
+				nodeURL := addr
+				if !strings.HasPrefix(nodeURL, "http://") && !strings.HasPrefix(nodeURL, "https://") {
+					nodeURL = "http://" + nodeURL
+				}
+				newNode, err := NewNode(nodeURL)
+				if err == nil {
+					newNode.SetID(id)
+					newNode.SetHealthy(true)
+					if id == leaderID {
+						newNode.SetRole("Leader")
+					} else {
+						newNode.SetRole("Follower")
+					}
+					newNode.SetMetadataCallback(ct.IngestMetadata)
+					ct.nodes = append(ct.nodes, newNode)
+					slog.Info("dynamically discovered new node via piggybacked metadata", slog.Int("node_id", id), slog.String("addr", addr))
+				}
+			}
+		}
+	}
+}
+
+func (ct *ClusterTracker) runEventStream() {
+	for {
+		select {
+		case <-ct.stopCh:
+			return
+		default:
+		}
+
+		leader := ct.Leader()
+		if leader == nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-ct.stopCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		eventsURL := fmt.Sprintf("%s/cluster/events", leader.RawAddr)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, eventsURL, nil)
+		if err != nil {
+			cancel()
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if ct.authUser != "" || ct.authPassword != "" {
+			req.SetBasicAuth(ct.authUser, ct.authPassword)
+		}
+
+		resp, err := ct.httpClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			cancel()
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		ct.consumeEventStream(resp.Body)
+		_ = resp.Body.Close()
+		cancel()
+
+		select {
+		case <-ct.stopCh:
+			return
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+type clusterEventPayload struct {
+	Type     string            `json:"type"`
+	NodeID   int               `json:"node_id"`
+	Addr     string            `json:"addr"`
+	Healthy  bool              `json:"healthy"`
+	LeaderID int               `json:"leader_id"`
+	Term     uint64            `json:"term"`
+	ConfRev  uint64            `json:"conf_rev"`
+	Peers    map[string]string `json:"peers"`
+}
+
+func (ct *ClusterTracker) consumeEventStream(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		select {
+		case <-ct.stopCh:
+			return
+		default:
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		rawJSON := strings.TrimPrefix(line, "data: ")
+
+		var ev clusterEventPayload
+		if err := json.Unmarshal([]byte(rawJSON), &ev); err != nil {
+			continue
+		}
+
+		ct.handleClusterEvent(ev)
+	}
+}
+
+func (ct *ClusterTracker) handleClusterEvent(ev clusterEventPayload) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	switch ev.Type {
+	case "peer_health":
+		for _, n := range ct.nodes {
+			if n.GetID() == ev.NodeID || (ev.Addr != "" && (strings.Contains(n.RawAddr, ev.Addr) || strings.Contains(ev.Addr, n.URL.Host))) {
+				n.SetHealthy(ev.Healthy)
+				break
+			}
+		}
+
+	case "leader_change":
+		if ev.LeaderID > 0 {
+			for _, n := range ct.nodes {
+				if n.GetID() == ev.LeaderID {
+					n.SetRole("Leader")
+					n.SetHealthy(true)
+				} else if n.GetRole() == "Leader" {
+					n.SetRole("Follower")
+				}
+			}
+		}
+
+	case "init", "conf_change":
+		if ev.LeaderID > 0 {
+			for _, n := range ct.nodes {
+				if n.GetID() == ev.LeaderID {
+					n.SetRole("Leader")
+				} else if n.GetRole() == "Leader" {
+					n.SetRole("Follower")
+				}
+			}
+		}
+		for idStr, addr := range ev.Peers {
+			id, _ := strconv.Atoi(idStr)
+			if id <= 0 || addr == "" {
+				continue
+			}
+			var found *Node
+			for _, n := range ct.nodes {
+				if n.GetID() == id || strings.Contains(n.RawAddr, addr) || strings.Contains(addr, n.URL.Host) {
+					found = n
+					break
+				}
+			}
+			if found != nil {
+				if found.GetID() <= 0 {
+					found.SetID(id)
+				}
+				found.SetHealthy(true)
+			} else {
+				nodeURL := addr
+				if !strings.HasPrefix(nodeURL, "http://") && !strings.HasPrefix(nodeURL, "https://") {
+					nodeURL = "http://" + nodeURL
+				}
+				newNode, err := NewNode(nodeURL)
+				if err == nil {
+					newNode.SetID(id)
+					newNode.SetHealthy(true)
+					if id == ev.LeaderID {
+						newNode.SetRole("Leader")
+					} else {
+						newNode.SetRole("Follower")
+					}
+					newNode.SetMetadataCallback(ct.IngestMetadata)
+					ct.nodes = append(ct.nodes, newNode)
+					slog.Info("dynamically added new node from cluster events", slog.Int("node_id", id), slog.String("addr", addr))
+				}
+			}
+		}
+	}
 }
 
 // Leader returns the current healthy Leader node, or nil if none found.

@@ -31,11 +31,61 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"node_id":   rs.ID(),
-			"role":      string(rs.Role()),
-			"term":      rs.Term(),
-			"leader_id": rs.Leader(),
+			"node_id":     rs.ID(),
+			"role":        string(rs.Role()),
+			"term":        rs.Term(),
+			"leader_id":   rs.Leader(),
+			"conf_rev":    rs.ConfRev(),
+			"peer_health": rs.PeerHealth(),
 		})
+	})
+
+	mux.HandleFunc("/cluster/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, `{"error":"streaming unsupported"}`, http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher.Flush()
+
+		ch, unsub := rs.SubscribeClusterEvents()
+		defer unsub()
+
+		// Initial cluster snapshot event
+		leaderID, term, _, peers := rs.Members()
+		peersMap := make(map[string]string, len(peers))
+		for id, addr := range peers {
+			peersMap[strconv.Itoa(id)] = addr
+		}
+		initEv := raft.ClusterEvent{
+			Type:     "init",
+			LeaderID: leaderID,
+			Term:     term,
+			ConfRev:  rs.ConfRev(),
+			Peers:    peersMap,
+		}
+		initData, _ := json.Marshal(initEv)
+		_, _ = fmt.Fprintf(w, "event: init\ndata: %s\n\n", initData)
+		flusher.Flush()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				data, _ := json.Marshal(ev)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+				flusher.Flush()
+			}
+		}
 	})
 
 	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
@@ -234,11 +284,13 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 		leaderID, term, confState, peers := rs.Members()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"leader_id": leaderID,
-			"term":      term,
-			"voters":    confState.Voters,
-			"learners":  confState.Learners,
-			"peers":     peers,
+			"leader_id":   leaderID,
+			"term":        term,
+			"conf_rev":    rs.ConfRev(),
+			"voters":      confState.Voters,
+			"learners":    confState.Learners,
+			"peers":       peers,
+			"peer_health": rs.PeerHealth(),
 		})
 	})
 
@@ -362,5 +414,16 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 	} else {
 		mgr = auth.NewStaticManager(auth.DefaultUsername, auth.DefaultPassword)
 	}
-	return mgr.Middleware(mux)
+
+	metadataMiddleware := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kairo-Leader-Id", strconv.Itoa(rs.Leader()))
+		w.Header().Set("X-Kairo-Term", strconv.FormatUint(rs.Term(), 10))
+		w.Header().Set("X-Kairo-Conf-Rev", strconv.FormatUint(rs.ConfRev(), 10))
+		if rs.Role() == state.Leader {
+			w.Header().Set("X-Kairo-Active-Peers", rs.ActivePeersHeader())
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	return mgr.Middleware(metadataMiddleware)
 }

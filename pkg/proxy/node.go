@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,9 @@ type Node struct {
 	ActiveReads   atomic.Int64
 	TotalRequests atomic.Uint64
 
+	// Callback invoked when cluster metadata is piggybacked in responses
+	onMetadata func(leaderID int, term uint64, confRev uint64, activePeers string)
+
 	// Reverse proxy instance directed to this specific node
 	ReverseProxy *httputil.ReverseProxy
 }
@@ -76,8 +80,51 @@ func NewNode(rawURL string) (*Node, error) {
 		req.Header.Set("X-Kairo-Proxied-By", "kairo-proxy")
 	}
 
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		leaderIDStr := resp.Header.Get("X-Kairo-Leader-Id")
+		termStr := resp.Header.Get("X-Kairo-Term")
+		confRevStr := resp.Header.Get("X-Kairo-Conf-Rev")
+		activePeers := resp.Header.Get("X-Kairo-Active-Peers")
+
+		if leaderIDStr != "" || activePeers != "" {
+			leaderID, _ := strconv.Atoi(leaderIDStr)
+			term, _ := strconv.ParseUint(termStr, 10, 64)
+			confRev, _ := strconv.ParseUint(confRevStr, 10, 64)
+
+			n.mu.RLock()
+			cb := n.onMetadata
+			n.mu.RUnlock()
+
+			if cb != nil {
+				cb(leaderID, term, confRev, activePeers)
+			}
+		}
+		return nil
+	}
+
 	n.ReverseProxy = proxy
 	return n, nil
+}
+
+// SetMetadataCallback assigns a listener invoked whenever metadata is piggybacked in responses.
+func (n *Node) SetMetadataCallback(cb func(leaderID int, term uint64, confRev uint64, activePeers string)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.onMetadata = cb
+}
+
+// SetID sets the node's cluster ID.
+func (n *Node) SetID(id int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ID = id
+}
+
+// SetRole sets the node's cluster role.
+func (n *Node) SetRole(role string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.Role = role
 }
 
 // UpdateStatus atomically updates the node's discovered cluster role and state.

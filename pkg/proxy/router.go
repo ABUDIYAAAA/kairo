@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -208,6 +209,19 @@ func (rt *Router) createProxyForNode(node *Node, errorHandler func(http.Response
 		origDirector(req)
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Header.Set("X-Kairo-Proxied-By", "kairo-proxy")
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		leaderIDStr := resp.Header.Get("X-Kairo-Leader-Id")
+		termStr := resp.Header.Get("X-Kairo-Term")
+		confRevStr := resp.Header.Get("X-Kairo-Conf-Rev")
+		activePeers := resp.Header.Get("X-Kairo-Active-Peers")
+		if leaderIDStr != "" || activePeers != "" {
+			leaderID, _ := strconv.Atoi(leaderIDStr)
+			term, _ := strconv.ParseUint(termStr, 10, 64)
+			confRev, _ := strconv.ParseUint(confRevStr, 10, 64)
+			rt.tracker.IngestMetadata(leaderID, term, confRev, activePeers)
+		}
+		return nil
 	}
 	return proxy
 }

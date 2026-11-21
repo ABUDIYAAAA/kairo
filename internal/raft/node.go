@@ -240,6 +240,13 @@ func (n *Node) ConfState() storage.ConfState {
 	return n.raft.ConfState()
 }
 
+// ConfRev returns the monotonic configuration change revision counter.
+func (n *Node) ConfRev() uint64 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.raft.ConfRev()
+}
+
 // IsLearnerCaughtUp checks whether a learner is ready for promotion to voter.
 func (n *Node) IsLearnerCaughtUp(id int) bool {
 	n.mu.RLock()

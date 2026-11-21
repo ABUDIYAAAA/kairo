@@ -1,4 +1,4 @@
-.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness test-chaos build-proxy run-proxy docker-build docker-up docker-down docker-status docker-logs test-containers
+.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness chaos-harness-containers test-chaos build-proxy run-proxy docker-build docker-up docker-down docker-status docker-logs test-containers
 
 BUILD_DIR := bin
 BINARY := $(BUILD_DIR)/kairo
@@ -15,6 +15,11 @@ PROXY ?= true
 VERBOSE ?= false
 PROXY_LISTEN ?= :8999
 PROXY_ENDPOINTS ?= http://127.0.0.1:9001,http://127.0.0.1:9002,http://127.0.0.1:9003
+
+CONTAINER_NODES ?= 3
+CONTAINER_WORKERS ?= 25
+CONTAINER_CHAOS_RATE ?= 400ms
+CONTAINER_TARGET_OPS ?= 500
 
 PEERS_NODE1 := "2=127.0.0.1:8002,3=127.0.0.1:8003"
 PEERS_NODE2 := "1=127.0.0.1:8001,3=127.0.0.1:8003"
@@ -87,12 +92,16 @@ test-all:
 # Build chaos harness binary
 build-harness:
 	@mkdir -p $(BUILD_DIR)
-	go build -o $(HARNESS_BINARY) cmd/chaos-harness/main.go
+	go build -o $(HARNESS_BINARY) ./cmd/chaos-harness
 	@echo "Build complete: $(HARNESS_BINARY)"
 
 # Run standalone chaos benchmark harness with client
 chaos-harness: build-harness
 	@$(HARNESS_BINARY) -nodes=$(NODES) -duration=$(DURATION) -workers=$(WORKERS) -chaos-rate=$(CHAOS_RATE) -target-ops=$(TARGET_OPS) -retries=$(RETRIES) -proxy=$(PROXY) -verbose=$(VERBOSE)
+
+# Run chaos benchmark harness against real Docker containers via testcontainers
+chaos-harness-containers: build-harness docker-build
+	@$(HARNESS_BINARY) -containers -nodes=$(CONTAINER_NODES) -duration=$(DURATION) -workers=$(CONTAINER_WORKERS) -chaos-rate=$(CONTAINER_CHAOS_RATE) -target-ops=$(CONTAINER_TARGET_OPS) -retries=$(RETRIES) -proxy=$(PROXY) -verbose=$(VERBOSE)
 
 # Run high-throughput chaos client test via go test
 test-chaos:

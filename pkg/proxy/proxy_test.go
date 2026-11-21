@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -431,5 +432,185 @@ func TestProxySimpleAuthAndCustomProtocol(t *testing.T) {
 	}
 	if goodResp.Header.Get("X-Kairo-Protocol") != "kairo/1.0" {
 		t.Fatalf("expected X-Kairo-Protocol: kairo/1.0, got %q", goodResp.Header.Get("X-Kairo-Protocol"))
+	}
+}
+
+// TestProxyDynamicDiscoveryViaPiggyback verifies that the proxy automatically discovers
+// a new remote node when its address is piggybacked in an upstream response.
+func TestProxyDynamicDiscoveryViaPiggyback(t *testing.T) {
+	var includeNode4 atomic.Bool
+
+	leaderSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kairo-Protocol", "kairo/1.0")
+		w.Header().Set("X-Kairo-Leader-Id", "1")
+		w.Header().Set("X-Kairo-Term", "2")
+		w.Header().Set("X-Kairo-Conf-Rev", "3")
+
+		if includeNode4.Load() {
+			w.Header().Set("X-Kairo-Active-Peers", "1="+r.Host+",4=10.0.0.4:8999")
+		} else {
+			w.Header().Set("X-Kairo-Active-Peers", "1="+r.Host)
+		}
+
+		if r.URL.Path == "/status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(StatusResponse{
+				NodeID:   1,
+				Role:     "Leader",
+				Term:     2,
+				LeaderID: 1,
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer leaderSrv.Close()
+
+	// 2. Start ClusterTracker seeded ONLY with node 1
+	tracker, err := NewClusterTracker([]string{leaderSrv.URL}, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to create tracker: %v", err)
+	}
+	defer tracker.Close()
+	tracker.Start()
+
+	if len(tracker.Nodes()) != 1 {
+		t.Fatalf("expected 1 initial node, got %d", len(tracker.Nodes()))
+	}
+
+	router := NewRouter(tracker)
+	proxySrv := httptest.NewServer(router)
+	defer proxySrv.Close()
+
+	// 3. New node joins cluster! Next write to leader carries active peers including node 4
+	includeNode4.Store(true)
+
+	req, _ := http.NewRequest(http.MethodPost, proxySrv.URL+"/put", strings.NewReader(`{"key":"foo","value":"bar"}`))
+	req.SetBasicAuth("kairo", "kairo-secret")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed request: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 4. Verify that Node 4 was dynamically ingested into the tracker on the fly!
+	nodes := tracker.Nodes()
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes after piggyback discovery, got %d", len(nodes))
+	}
+
+	var node4Found bool
+	for _, n := range nodes {
+		if n.GetID() == 4 && strings.Contains(n.RawAddr, "10.0.0.4:8999") {
+			node4Found = true
+			if !n.IsHealthy() {
+				t.Fatalf("expected discovered Node 4 to be healthy")
+			}
+		}
+	}
+	if !node4Found {
+		t.Fatalf("expected Node 4 to be discovered via piggyback metadata")
+	}
+}
+
+// TestProxyClusterEventsHealthPush verifies that leader heartbeat notifications
+// pushed via SSE instantly update the proxy's routing table without waiting for polling.
+func TestProxyClusterEventsHealthPush(t *testing.T) {
+	eventsCh := make(chan string, 10)
+
+	leaderSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kairo-Leader-Id", "1")
+		w.Header().Set("X-Kairo-Term", "1")
+		w.Header().Set("X-Kairo-Conf-Rev", "1")
+
+		if r.URL.Path == "/status" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(StatusResponse{
+				NodeID:   1,
+				Role:     "Leader",
+				Term:     1,
+				LeaderID: 1,
+			})
+			return
+		}
+
+		if r.URL.Path == "/cluster/events" {
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "streaming unsupported", 500)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher.Flush()
+
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case msg, ok := <-eventsCh:
+					if !ok {
+						return
+					}
+					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", "peer_health", msg)
+					flusher.Flush()
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer leaderSrv.Close()
+
+	followerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(StatusResponse{
+			NodeID:   2,
+			Role:     "Follower",
+			Term:     1,
+			LeaderID: 1,
+		})
+	}))
+	defer followerSrv.Close()
+
+	// Seed tracker with leader and follower with a very long polling interval (1 hour!)
+	tracker, err := NewClusterTracker([]string{leaderSrv.URL, followerSrv.URL}, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("failed to create tracker: %v", err)
+	}
+	defer tracker.Close()
+	defer close(eventsCh)
+	tracker.Start()
+
+	// Wait for tracker to discover roles
+	time.Sleep(100 * time.Millisecond)
+
+	var node2 *Node
+	for _, n := range tracker.Nodes() {
+		if n.GetID() == 2 {
+			node2 = n
+		}
+	}
+	if node2 == nil || !node2.IsHealthy() {
+		t.Fatalf("expected node 2 to be initially healthy")
+	}
+
+	// Leader detects peer 2 failed heartbeats and pushes event down the stream
+	eventsCh <- `{"type":"peer_health","node_id":2,"healthy":false}`
+
+	// Wait for SSE ingestion
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !node2.IsHealthy() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if node2.IsHealthy() {
+		t.Fatalf("expected node 2 to be marked UNHEALTHY via SSE heartbeat push within 500ms")
 	}
 }

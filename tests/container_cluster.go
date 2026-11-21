@@ -316,6 +316,95 @@ func (cc *ContainerCluster) WaitLeader(ctx context.Context, timeout time.Duratio
 	return 0, errors.New("timeout waiting for leader election in container cluster")
 }
 
+// ContainerNodeStatus holds the role and metadata of a container node.
+type ContainerNodeStatus struct {
+	Role     string `json:"role"`
+	NodeID   int    `json:"node_id"`
+	LeaderID int    `json:"leader_id"`
+	Term     uint64 `json:"term"`
+}
+
+// NodeStatus queries the HTTP /status endpoint of a specific container node.
+func (cc *ContainerCluster) NodeStatus(ctx context.Context, nodeID int) (*ContainerNodeStatus, error) {
+	url := cc.NodeURL(nodeID)
+	if url == "" {
+		return nil, fmt.Errorf("node %d endpoint not available", nodeID)
+	}
+
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth("kairo", "kairo-secret")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("node %d status returned HTTP %d", nodeID, resp.StatusCode)
+	}
+
+	var status ContainerNodeStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// Leader queries all reachable nodes to discover the current cluster leader and highest term.
+func (cc *ContainerCluster) Leader(ctx context.Context) (int, uint64) {
+	var bestLeader int
+	var highestTerm uint64
+
+	for id := 1; id <= cc.size; id++ {
+		st, err := cc.NodeStatus(ctx, id)
+		if err == nil && st.Role == "Leader" && st.NodeID == id {
+			if st.Term >= highestTerm {
+				highestTerm = st.Term
+				bestLeader = id
+			}
+		}
+	}
+	return bestLeader, highestTerm
+}
+
+// TriggerSnapshot triggers log compaction and snapshotting on a container node.
+func (cc *ContainerCluster) TriggerSnapshot(ctx context.Context, nodeID int) error {
+	url := cc.NodeURL(nodeID)
+	if url == "" {
+		return fmt.Errorf("node %d endpoint not available", nodeID)
+	}
+
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/snapshot", nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth("kairo", "kairo-secret")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("snapshot returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Size returns the configured cluster size.
+func (cc *ContainerCluster) Size() int {
+	cc.mu.RLock()
+	defer cc.mu.RUnlock()
+	return cc.size
+}
+
 // NewClient returns a Kairo Go Client SDK connected to all cluster nodes or the proxy.
 func (cc *ContainerCluster) NewClient(useProxy bool) (*client.Client, error) {
 	var eps []string

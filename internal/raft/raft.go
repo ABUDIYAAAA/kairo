@@ -55,6 +55,7 @@ type Raft struct {
 
 	// Membership configuration tracking (Ongaro §4.1 / etcd semantics)
 	pendingConfIndex uint64 // Highest uncommitted EntryConfChange index
+	confRev          uint64 // Incremented on every committed configuration change
 	removed          bool   // True if local node was removed from the cluster
 
 	// Ticks and timeouts (logical clock)
@@ -153,6 +154,7 @@ func NewRaft(c Config) *Raft {
 		minElectionTimeout: c.ElectionTimeout,
 		heartbeatTimeout:   c.HeartbeatTimeout,
 		preVote:            c.PreVote,
+		confRev:            1,
 		readIndexPending:   make(map[string]*readIndexTracker),
 	}
 
@@ -320,8 +322,9 @@ func (r *Raft) ApplyConfChange(cc storage.ConfChange) (storage.ConfState, error)
 		return r.ConfState(), fmt.Errorf("unknown conf change type: %s", cc.Type)
 	}
 
-	// Clear pendingConfIndex on committed application
+	// Clear pendingConfIndex and bump configuration revision on committed application
 	r.pendingConfIndex = 0
+	r.confRev++
 
 	// Quorum may have changed (e.g. node removed); check if new commits are possible
 	if r.role == state.Leader {
@@ -329,6 +332,11 @@ func (r *Raft) ApplyConfChange(cc storage.ConfChange) (storage.ConfState, error)
 	}
 
 	return r.ConfState(), nil
+}
+
+// ConfRev returns the monotonic configuration change revision counter.
+func (r *Raft) ConfRev() uint64 {
+	return r.confRev
 }
 
 func (r *Raft) resetRandomElectionTimeout(base int) {
@@ -483,7 +491,6 @@ func (r *Raft) Step(m Message) error {
 			majority := r.voterQuorum()
 			if granted >= majority {
 				r.becomeLeader()
-				r.bcastAppend()
 			}
 		}
 
