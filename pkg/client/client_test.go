@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -855,5 +856,29 @@ func TestClientWatchAutoResyncOnCompacted(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for live event")
+	}
+}
+
+func TestClientMemoryLimitError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/put" {
+			http.Error(w, `{"error":"memory limit exceeded: quota exhausted"}`, http.StatusInsufficientStorage)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	cli, err := New(Config{
+		Endpoints: []string{server.URL},
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer cli.Close()
+
+	_, err = cli.Put(context.Background(), "some-key", "some-value")
+	if !errors.Is(err, ErrMemoryLimitExceeded) {
+		t.Fatalf("expected ErrMemoryLimitExceeded, got: %v", err)
 	}
 }

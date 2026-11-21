@@ -138,6 +138,9 @@ func (c *Client) putInternal(ctx context.Context, key, value string, expectedVer
 	case http.StatusConflict:
 		return nil, ErrVersionMismatch
 
+	case http.StatusInsufficientStorage:
+		return nil, ErrMemoryLimitExceeded
+
 	case http.StatusServiceUnavailable:
 		if strings.Contains(string(body), "no elected leader") {
 			return nil, ErrNoLeader

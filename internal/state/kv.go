@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 )
@@ -18,7 +19,88 @@ var (
 	// ErrVersionMismatch indicates that a conditional mutation was rejected because
 	// the key's current version does not match the expected version.
 	ErrVersionMismatch = errors.New("version mismatch")
+
+	// ErrMemoryLimitExceeded indicates that a write mutation was rejected because
+	// the key-value store reached its configured memory capacity limit.
+	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
 )
+
+// EvictionPolicy defines how the state machine behaves when maxMemoryBytes is reached.
+type EvictionPolicy string
+
+const (
+	// EvictionPolicyReject rejects mutations when the memory limit is reached (returns ErrMemoryLimitExceeded).
+	EvictionPolicyReject EvictionPolicy = "reject"
+
+	// EvictionPolicyLRU evicts the key with the lowest ModRevision (oldest modified) to free space.
+	EvictionPolicyLRU EvictionPolicy = "lru"
+)
+
+// ItemOverheadBytes represents estimated metadata and map entry overhead per key-value record.
+const ItemOverheadBytes int64 = 64
+
+// itemSize calculates the tracked in-memory footprint of a key-value record.
+func itemSize(key, val string) int64 {
+	return int64(len(key)+len(val)) + ItemOverheadBytes
+}
+
+// ParseBytes parses human-readable byte sizes (e.g. "512MB", "1GB", "64KB", "1048576").
+func ParseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+
+	var multiplier int64 = 1
+	var numStr string
+
+	if strings.HasSuffix(s, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		numStr = strings.TrimSuffix(s, "GB")
+	} else if strings.HasSuffix(s, "G") {
+		multiplier = 1024 * 1024 * 1024
+		numStr = strings.TrimSuffix(s, "G")
+	} else if strings.HasSuffix(s, "MB") {
+		multiplier = 1024 * 1024
+		numStr = strings.TrimSuffix(s, "MB")
+	} else if strings.HasSuffix(s, "M") {
+		multiplier = 1024 * 1024
+		numStr = strings.TrimSuffix(s, "M")
+	} else if strings.HasSuffix(s, "KB") {
+		multiplier = 1024
+		numStr = strings.TrimSuffix(s, "KB")
+	} else if strings.HasSuffix(s, "K") {
+		multiplier = 1024
+		numStr = strings.TrimSuffix(s, "K")
+	} else if strings.HasSuffix(s, "B") {
+		multiplier = 1
+		numStr = strings.TrimSuffix(s, "B")
+	} else {
+		numStr = s
+	}
+
+	val, err := fmt.Sscanf(strings.TrimSpace(numStr), "%d", &multiplier)
+	_ = val
+	var intVal int64
+	_, err = fmt.Sscan(strings.TrimSpace(numStr), &intVal)
+	if err != nil || intVal < 0 {
+		return 0, fmt.Errorf("invalid byte size %q", s)
+	}
+
+	// Calculate total bytes
+	baseMultiplier := multiplier
+	if strings.HasSuffix(s, "GB") || strings.HasSuffix(s, "G") {
+		baseMultiplier = 1024 * 1024 * 1024
+	} else if strings.HasSuffix(s, "MB") || strings.HasSuffix(s, "M") {
+		baseMultiplier = 1024 * 1024
+	} else if strings.HasSuffix(s, "KB") || strings.HasSuffix(s, "K") {
+		baseMultiplier = 1024
+	} else {
+		baseMultiplier = 1
+	}
+
+	return intVal * baseMultiplier, nil
+}
 
 // Item represents a stored value with versioning metadata.
 type Item struct {
@@ -75,6 +157,11 @@ type KVStore struct {
 
 	// Real-time key/prefix subscription dispatcher
 	hub *WatcherHub
+
+	// Memory limits and eviction policy
+	maxMemoryBytes  int64
+	evictionPolicy  EvictionPolicy
+	usedMemoryBytes int64
 }
 
 // NewKVStore creates an initialized in-memory KV store state machine.
@@ -84,7 +171,28 @@ func NewKVStore() *KVStore {
 		revision:       0,
 		clientSessions: make(map[string]ClientResult),
 		hub:            NewWatcherHub(1000),
+		evictionPolicy: EvictionPolicyReject,
 	}
+}
+
+// SetMemoryLimit configures the maximum memory allowance in bytes and the eviction policy.
+// If maxBytes is 0, memory capacity is unlimited.
+func (s *KVStore) SetMemoryLimit(maxBytes int64, policy EvictionPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if policy == "" {
+		policy = EvictionPolicyReject
+	}
+	s.maxMemoryBytes = maxBytes
+	s.evictionPolicy = policy
+}
+
+// MemoryStats returns the current tracked memory footprint, configured maximum, and eviction policy.
+func (s *KVStore) MemoryStats() (usedBytes int64, maxBytes int64, policy EvictionPolicy) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.usedMemoryBytes, s.maxMemoryBytes, s.evictionPolicy
 }
 
 // SetWatcherHub configures a custom WatcherHub.
@@ -136,11 +244,63 @@ func (s *KVStore) Put(key, value string) Item {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.putLocked(key, value)
+	item, _ := s.putLocked(key, value)
+	return item
 }
 
-func (s *KVStore) putLocked(key, value string) Item {
+func (s *KVStore) putLocked(key, value string) (Item, error) {
+	var oldSize int64
+	if existing, exists := s.data[key]; exists {
+		oldSize = itemSize(key, existing.Value)
+	}
+	newSize := itemSize(key, value)
+	delta := newSize - oldSize
+
+	if s.maxMemoryBytes > 0 && s.usedMemoryBytes+delta > s.maxMemoryBytes {
+		if s.evictionPolicy == EvictionPolicyReject || s.evictionPolicy == "" {
+			return Item{}, ErrMemoryLimitExceeded
+		}
+
+		if s.evictionPolicy == EvictionPolicyLRU {
+			// Deterministically evict items with lowest ModRevision
+			for s.usedMemoryBytes+delta > s.maxMemoryBytes {
+				var oldestKey string
+				var oldestRev uint64 = math.MaxUint64
+
+				for k, itm := range s.data {
+					if k == key {
+						continue // Do not evict the key currently being mutated
+					}
+					if itm.ModRevision < oldestRev {
+						oldestRev = itm.ModRevision
+						oldestKey = k
+					}
+				}
+
+				if oldestKey == "" {
+					// Cannot free enough space (e.g. this single key exceeds maxMemoryBytes)
+					return Item{}, ErrMemoryLimitExceeded
+				}
+
+				evicted := s.data[oldestKey]
+				delete(s.data, oldestKey)
+				s.usedMemoryBytes -= itemSize(oldestKey, evicted.Value)
+
+				if s.hub != nil {
+					s.hub.Publish(WatchEvent{
+						Type:        EventDelete,
+						Key:         oldestKey,
+						Version:     evicted.Version + 1,
+						ModRevision: s.revision,
+						PrevValue:   evicted.Value,
+					})
+				}
+			}
+		}
+	}
+
 	s.revision++
+	s.usedMemoryBytes += delta
 
 	var newVersion uint64 = 1
 	var prevVal string
@@ -168,7 +328,7 @@ func (s *KVStore) putLocked(key, value string) Item {
 		})
 	}
 
-	return item
+	return item, nil
 }
 
 // PutWithClient executes a Put with Raft §8 client deduplication.
@@ -208,7 +368,10 @@ func (s *KVStore) PutWithClientAndVersion(clientID string, seqNum uint64, key, v
 		}
 	}
 
-	item := s.putLocked(key, value)
+	item, err := s.putLocked(key, value)
+	if err != nil {
+		return Item{}, err
+	}
 
 	if clientID != "" {
 		s.clientSessions[clientID] = ClientResult{
@@ -248,6 +411,10 @@ func (s *KVStore) deleteLocked(key string) (Item, error) {
 		ModRevision: s.revision,
 	}
 
+	s.usedMemoryBytes -= itemSize(key, existing.Value)
+	if s.usedMemoryBytes < 0 {
+		s.usedMemoryBytes = 0
+	}
 	delete(s.data, key)
 
 	if s.hub != nil {
@@ -347,6 +514,11 @@ func (s *KVStore) Restore(data []byte) error {
 	s.clientSessions = snap.ClientSessions
 	if s.clientSessions == nil {
 		s.clientSessions = make(map[string]ClientResult)
+	}
+
+	s.usedMemoryBytes = 0
+	for k, itm := range s.data {
+		s.usedMemoryBytes += itemSize(k, itm.Value)
 	}
 
 	if s.hub != nil {

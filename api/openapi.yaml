@@ -269,6 +269,19 @@ components:
           example:
             "2": true
             "3": true
+        memory_used_bytes:
+          type: integer
+          description: Total tracked in-memory footprint of all keys and values in bytes.
+          example: 1048576
+        memory_max_bytes:
+          type: integer
+          description: Configured memory limit in bytes (0 for unlimited).
+          example: 536870912
+        eviction_policy:
+          type: string
+          enum: [reject, lru]
+          description: Eviction policy active when memory quota is exhausted.
+          example: "reject"
 
     MembersResponse:
       type: object
@@ -315,6 +328,19 @@ components:
           example:
             "2": true
             "3": true
+        memory_used_bytes:
+          type: integer
+          description: Total tracked in-memory footprint of all keys and values in bytes.
+          example: 1048576
+        memory_max_bytes:
+          type: integer
+          description: Configured memory limit in bytes (0 for unlimited).
+          example: 536870912
+        eviction_policy:
+          type: string
+          enum: [reject, lru]
+          description: Eviction policy active when memory quota is exhausted.
+          example: "reject"
 
     MemberAddRequest:
       type: object
@@ -493,6 +519,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '507':
+          description: Memory limit exceeded (quota exhausted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /put:
     post:
@@ -546,6 +578,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '507':
+          description: Memory limit exceeded (quota exhausted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /delete:
     post:
@@ -590,6 +628,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '503':
           description: Cluster has no elected leader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '507':
+          description: Memory limit exceeded (quota exhausted)
           content:
             application/json:
               schema:

@@ -108,21 +108,25 @@ func main() {
 	logLevel := flag.String("log-level", "", "Logging level: debug, info, warn, error (default: info)")
 	logFormat := flag.String("log-format", "", "Logging format: text, json (default: text)")
 	preVote := flag.Bool("pre-vote", true, "Enable Pre-Vote protocol (Ongaro §9.6) to prevent election disruptions")
+	maxMemory := flag.String("max-memory", "", "Maximum memory capacity limit before eviction/rejection (e.g. 512MB, 1GB; 0 or empty for unlimited)")
+	evictionPolicy := flag.String("eviction-policy", "", "Eviction policy when max-memory is reached: 'reject' (default) or 'lru'")
 
 	flag.Parse()
 
 	// 1. Resolve configuration from flags, environment variables, and auto-discovery
 	cfg, err := ResolveConfig(ConfigFlags{
-		ID:           *nodeID,
-		Addr:         *addr,
-		ClientAddr:   *clientAddr,
-		ClusterSize:  *clusterSize,
-		Peers:        *peersStr,
-		PeerTemplate: *peerTemplate,
-		DataDir:      *dataDir,
-		LogLevel:     *logLevel,
-		LogFormat:    *logFormat,
-		PreVote:      *preVote,
+		ID:             *nodeID,
+		Addr:           *addr,
+		ClientAddr:     *clientAddr,
+		ClusterSize:    *clusterSize,
+		Peers:          *peersStr,
+		PeerTemplate:   *peerTemplate,
+		DataDir:        *dataDir,
+		LogLevel:       *logLevel,
+		LogFormat:      *logFormat,
+		PreVote:        *preVote,
+		MaxMemory:      *maxMemory,
+		EvictionPolicy: *evictionPolicy,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to resolve configuration: %v\n", err)
@@ -140,6 +144,8 @@ func main() {
 		slog.Any("peers", cfg.Peers),
 		slog.String("log_level", cfg.LogLevel),
 		slog.String("log_format", cfg.LogFormat),
+		slog.Int64("max_memory_bytes", cfg.MaxMemoryBytes),
+		slog.String("eviction_policy", cfg.EvictionPolicy),
 	)
 
 	// 2. Initialize persistent stable storage
@@ -157,6 +163,8 @@ func main() {
 		Peers:          cfg.Peers,
 		Storage:        store,
 		DisablePreVote: !cfg.PreVote,
+		MaxMemoryBytes: cfg.MaxMemoryBytes,
+		EvictionPolicy: cfg.EvictionPolicy,
 	}
 
 	rServer, err := raft.NewRaftServer(serverCfg)

@@ -58,13 +58,34 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		var nodeID int
+		var role string
+		var term, confRev uint64
+		var leaderID int
+		var peerHealth map[int]bool
+		var usedMem, maxMem int64
+		var evictionPolicy state.EvictionPolicy
+
+		if rs != nil {
+			nodeID = rs.ID()
+			role = string(rs.Role())
+			term = rs.Term()
+			leaderID = rs.Leader()
+			confRev = rs.ConfRev()
+			peerHealth = rs.PeerHealth()
+			usedMem, maxMem, evictionPolicy = rs.MemoryStats()
+		}
+
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"node_id":     rs.ID(),
-			"role":        string(rs.Role()),
-			"term":        rs.Term(),
-			"leader_id":   rs.Leader(),
-			"conf_rev":    rs.ConfRev(),
-			"peer_health": rs.PeerHealth(),
+			"node_id":           nodeID,
+			"role":              role,
+			"term":              term,
+			"leader_id":         leaderID,
+			"conf_rev":          confRev,
+			"peer_health":       peerHealth,
+			"memory_used_bytes": usedMem,
+			"memory_max_bytes":  maxMem,
+			"eviction_policy":   string(evictionPolicy),
 		})
 	})
 
@@ -189,6 +210,8 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 		if err != nil {
 			if errors.Is(err, state.ErrVersionMismatch) {
 				http.Error(w, `{"error":"version mismatch"}`, http.StatusConflict)
+			} else if errors.Is(err, state.ErrMemoryLimitExceeded) {
+				http.Error(w, `{"error":"memory limit exceeded: quota exhausted"}`, http.StatusInsufficientStorage)
 			} else if errors.Is(err, raft.ErrNotLeader) {
 				http.Error(w, `{"error":"cluster has no elected leader"}`, http.StatusServiceUnavailable)
 			} else {

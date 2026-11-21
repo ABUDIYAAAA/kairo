@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/ABUDIYAAAA/kairo/internal/state"
 )
 
 var trailingDigitsRegex = regexp.MustCompile(`[-_](\d+)$|^[a-zA-Z]+(\d+)$`)
@@ -22,20 +24,24 @@ type Config struct {
 	LogFormat    string
 	PreVote      bool
 	PeerTemplate string
+	MaxMemoryBytes int64
+	EvictionPolicy string
 }
 
 // ConfigFlags contains raw command-line flag inputs.
 type ConfigFlags struct {
-	ID           int
-	Addr         string
-	ClientAddr   string
-	ClusterSize  int
-	Peers        string
-	DataDir      string
-	LogLevel     string
-	LogFormat    string
-	PreVote      bool
-	PeerTemplate string
+	ID             int
+	Addr           string
+	ClientAddr     string
+	ClusterSize    int
+	Peers          string
+	DataDir        string
+	LogLevel       string
+	LogFormat      string
+	PreVote        bool
+	PeerTemplate   string
+	MaxMemory      string
+	EvictionPolicy string
 }
 
 // detectIDFromHostname attempts to parse a trailing number from the hostname (e.g. "kairo-1" -> 1, "node_2" -> 2).
@@ -178,6 +184,31 @@ func ResolveConfig(flags ConfigFlags) (Config, error) {
 	} else {
 		cfg.PreVote = flags.PreVote
 	}
+
+	// 10. Memory Limit & Eviction Policy
+	maxMemStr := flags.MaxMemory
+	if maxMemStr == "" {
+		maxMemStr = os.Getenv("KAIRO_MAX_MEMORY")
+	}
+	if maxMemStr != "" {
+		maxBytes, err := state.ParseBytes(maxMemStr)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid max memory limit %q: %w", maxMemStr, err)
+		}
+		cfg.MaxMemoryBytes = maxBytes
+	}
+
+	evictionPolicy := strings.ToLower(strings.TrimSpace(flags.EvictionPolicy))
+	if evictionPolicy == "" {
+		evictionPolicy = strings.ToLower(strings.TrimSpace(os.Getenv("KAIRO_EVICTION_POLICY")))
+	}
+	if evictionPolicy == "" {
+		evictionPolicy = string(state.EvictionPolicyReject)
+	}
+	if evictionPolicy != string(state.EvictionPolicyReject) && evictionPolicy != string(state.EvictionPolicyLRU) {
+		return cfg, fmt.Errorf("invalid eviction policy %q, expected 'reject' or 'lru'", evictionPolicy)
+	}
+	cfg.EvictionPolicy = evictionPolicy
 
 	return cfg, nil
 }

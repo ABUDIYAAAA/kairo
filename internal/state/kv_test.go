@@ -2,9 +2,11 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestKVStoreBasicPutGet(t *testing.T) {
@@ -248,6 +250,134 @@ func TestKVStoreCAS(t *testing.T) {
 	})
 	_, err = kv.Apply(cmdBytes)
 	if err != ErrVersionMismatch {
-		t.Fatalf("expected ErrVersionMismatch via Apply, got %v", err)
+		t.Fatalf("expected ErrVersionMismatch from Apply, got %v", err)
+	}
+}
+
+func TestParseBytes(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int64
+		wantErr  bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"1024", 1024, false},
+		{"64KB", 64 * 1024, false},
+		{"64K", 64 * 1024, false},
+		{"512MB", 512 * 1024 * 1024, false},
+		{"512M", 512 * 1024 * 1024, false},
+		{"1GB", 1024 * 1024 * 1024, false},
+		{"1G", 1024 * 1024 * 1024, false},
+		{"invalid", 0, true},
+	}
+
+	for _, tc := range tests {
+		actual, err := ParseBytes(tc.input)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ParseBytes(%q) error = %v, wantErr %v", tc.input, err, tc.wantErr)
+			continue
+		}
+		if actual != tc.expected {
+			t.Errorf("ParseBytes(%q) = %d, expected %d", tc.input, actual, tc.expected)
+		}
+	}
+}
+
+func TestKVStoreMemoryLimitReject(t *testing.T) {
+	kv := NewKVStore()
+	// Set limit that allows ~2 small keys (each key+value+64 is ~70-75 bytes)
+	kv.SetMemoryLimit(160, EvictionPolicyReject)
+
+	// 1. First key fits
+	_, err := kv.PutWithClientAndVersion("c1", 1, "k1", "val1", nil)
+	if err != nil {
+		t.Fatalf("expected k1 to fit, got: %v", err)
+	}
+
+	// 2. Second key fits
+	_, err = kv.PutWithClientAndVersion("c1", 2, "k2", "val2", nil)
+	if err != nil {
+		t.Fatalf("expected k2 to fit, got: %v", err)
+	}
+
+	// 3. Third key exceeds 160 bytes and should be rejected with ErrMemoryLimitExceeded
+	_, err = kv.PutWithClientAndVersion("c1", 3, "k3", "val3", nil)
+	if !errors.Is(err, ErrMemoryLimitExceeded) {
+		t.Fatalf("expected ErrMemoryLimitExceeded, got: %v", err)
+	}
+
+	// 4. Verify existing keys can still be read
+	itm, err := kv.Get("k1")
+	if err != nil || itm.Value != "val1" {
+		t.Fatalf("expected k1 to be readable, got: %v", err)
+	}
+
+	// 5. Delete k1 to free memory
+	_, err = kv.Delete("k1")
+	if err != nil {
+		t.Fatalf("expected Delete k1 to succeed, got: %v", err)
+	}
+
+	// 6. Now k3 fits!
+	_, err = kv.PutWithClientAndVersion("c1", 4, "k3", "val3", nil)
+	if err != nil {
+		t.Fatalf("expected k3 to fit after deleting k1, got: %v", err)
+	}
+}
+
+func TestKVStoreMemoryLimitLRU(t *testing.T) {
+	kv := NewKVStore()
+	hub := NewWatcherHub(100)
+	kv.SetWatcherHub(hub)
+
+	// Space for ~2 items
+	kv.SetMemoryLimit(160, EvictionPolicyLRU)
+
+	// Subscribe to watch events to verify eviction notifications
+	w, _, err := hub.Watch("", true, 0)
+	if err != nil {
+		t.Fatalf("failed to watch: %v", err)
+	}
+	defer hub.Unwatch(w.ID)
+	evCh := w.Events
+
+	// Put k1 (ModRevision 1)
+	_, _ = kv.PutWithClientAndVersion("c1", 1, "k1", "val1", nil)
+	// Put k2 (ModRevision 2)
+	_, _ = kv.PutWithClientAndVersion("c1", 2, "k2", "val2", nil)
+
+	// Drain PUT events
+	<-evCh
+	<-evCh
+
+	// Put k3 (should evict k1 because it has the lowest ModRevision = 1)
+	_, err = kv.PutWithClientAndVersion("c1", 3, "k3", "val3", nil)
+	if err != nil {
+		t.Fatalf("expected k3 to succeed with LRU eviction, got: %v", err)
+	}
+
+	// k1 should no longer exist
+	_, err = kv.Get("k1")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected k1 to be evicted, got: %v", err)
+	}
+
+	// k2 and k3 should exist
+	if _, err := kv.Get("k2"); err != nil {
+		t.Fatalf("expected k2 to remain, got: %v", err)
+	}
+	if _, err := kv.Get("k3"); err != nil {
+		t.Fatalf("expected k3 to remain, got: %v", err)
+	}
+
+	// Verify DELETE watch event was published for the evicted k1
+	select {
+	case ev := <-evCh:
+		if ev.Type != EventDelete || ev.Key != "k1" {
+			t.Fatalf("expected EventDelete for k1, got %+v", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for eviction event")
 	}
 }

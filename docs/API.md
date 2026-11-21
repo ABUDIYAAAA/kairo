@@ -560,7 +560,10 @@ Returns the current Raft role, term, leader ID, topology revision, and peer hear
   "peer_health": {
     "2": true,
     "3": true
-  }
+  },
+  "memory_used_bytes": 1048576,
+  "memory_max_bytes": 536870912,
+  "eviction_policy": "reject"
 }
 ```
 
@@ -766,6 +769,7 @@ Retrieves the value, per-key version, and cluster modification revision for a ke
 |401|[Unauthorized](https://tools.ietf.org/html/rfc7235#section-3.1)|Missing or invalid HTTP Basic Authentication credentials|[ErrorResponse](#schemaerrorresponse)|
 |404|[Not Found](https://tools.ietf.org/html/rfc7231#section-6.5.4)|Key does not exist|[ErrorResponse](#schemaerrorresponse)|
 |503|[Service Unavailable](https://tools.ietf.org/html/rfc7231#section-6.6.4)|Cluster has no elected leader|[ErrorResponse](#schemaerrorresponse)|
+|507|[Insufficient Storage](https://tools.ietf.org/html/rfc2518#section-10.6)|Memory limit exceeded (quota exhausted)|[ErrorResponse](#schemaerrorresponse)|
 
 ### Response Headers
 
@@ -981,6 +985,7 @@ Returns HTTP 409 Conflict if current version does not match.
 |401|[Unauthorized](https://tools.ietf.org/html/rfc7235#section-3.1)|Missing or invalid HTTP Basic Authentication credentials|[ErrorResponse](#schemaerrorresponse)|
 |409|[Conflict](https://tools.ietf.org/html/rfc7231#section-6.5.8)|Version mismatch (CAS conflict)|[ErrorResponse](#schemaerrorresponse)|
 |503|[Service Unavailable](https://tools.ietf.org/html/rfc7231#section-6.6.4)|Cluster has no elected leader|[ErrorResponse](#schemaerrorresponse)|
+|507|[Insufficient Storage](https://tools.ietf.org/html/rfc2518#section-10.6)|Memory limit exceeded (quota exhausted)|[ErrorResponse](#schemaerrorresponse)|
 
 ### Response Headers
 
@@ -1188,6 +1193,7 @@ Removes a key from the state machine via Raft consensus. Returns the deleted rec
 |401|[Unauthorized](https://tools.ietf.org/html/rfc7235#section-3.1)|Missing or invalid HTTP Basic Authentication credentials|[ErrorResponse](#schemaerrorresponse)|
 |404|[Not Found](https://tools.ietf.org/html/rfc7231#section-6.5.4)|Key not found|[ErrorResponse](#schemaerrorresponse)|
 |503|[Service Unavailable](https://tools.ietf.org/html/rfc7231#section-6.6.4)|Cluster has no elected leader|[ErrorResponse](#schemaerrorresponse)|
+|507|[Insufficient Storage](https://tools.ietf.org/html/rfc2518#section-10.6)|Memory limit exceeded (quota exhausted)|[ErrorResponse](#schemaerrorresponse)|
 
 ### Response Headers
 
@@ -1922,7 +1928,10 @@ Returns current active leader, voters, learners, and peer network endpoints.
   "peer_health": {
     "2": true,
     "3": true
-  }
+  },
+  "memory_used_bytes": 1048576,
+  "memory_max_bytes": 536870912,
+  "eviction_policy": "reject"
 }
 ```
 
@@ -3140,7 +3149,10 @@ This operation does not require authentication
   "peer_health": {
     "2": true,
     "3": true
-  }
+  },
+  "memory_used_bytes": 1048576,
+  "memory_max_bytes": 536870912,
+  "eviction_policy": "reject"
 }
 
 ```
@@ -3156,6 +3168,9 @@ This operation does not require authentication
 |conf_rev|integer|true|none|none|
 |peer_health|object|true|none|none|
 |» **additionalProperties**|boolean|false|none|none|
+|memory_used_bytes|integer|false|none|Total tracked in-memory footprint of all keys and values in bytes.|
+|memory_max_bytes|integer|false|none|Configured memory limit in bytes (0 for unlimited).|
+|eviction_policy|string|false|none|Eviction policy active when memory quota is exhausted.|
 
 #### Enumerated Values
 
@@ -3165,6 +3180,8 @@ This operation does not require authentication
 |role|Candidate|
 |role|Leader|
 |role|Learner|
+|eviction_policy|reject|
+|eviction_policy|lru|
 
 <h2 id="tocS_MembersResponse">MembersResponse</h2>
 <!-- backwards compatibility -->
@@ -3192,7 +3209,10 @@ This operation does not require authentication
   "peer_health": {
     "2": true,
     "3": true
-  }
+  },
+  "memory_used_bytes": 1048576,
+  "memory_max_bytes": 536870912,
+  "eviction_policy": "reject"
 }
 
 ```
@@ -3210,6 +3230,16 @@ This operation does not require authentication
 |» **additionalProperties**|string|false|none|none|
 |peer_health|object|true|none|none|
 |» **additionalProperties**|boolean|false|none|none|
+|memory_used_bytes|integer|false|none|Total tracked in-memory footprint of all keys and values in bytes.|
+|memory_max_bytes|integer|false|none|Configured memory limit in bytes (0 for unlimited).|
+|eviction_policy|string|false|none|Eviction policy active when memory quota is exhausted.|
+
+#### Enumerated Values
+
+|Property|Value|
+|---|---|
+|eviction_policy|reject|
+|eviction_policy|lru|
 
 <h2 id="tocS_MemberAddRequest">MemberAddRequest</h2>
 <!-- backwards compatibility -->

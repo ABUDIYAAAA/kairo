@@ -70,6 +70,8 @@ type ServerConfig struct {
 	SnapshotThreshold uint64        // Number of entries before triggering compaction; 0 defaults to 100
 	ProposeTimeout    time.Duration // Max duration for proposals/linearizable reads before returning ErrTimeout (defaults to 500ms)
 	DisablePreVote    bool          // If true, disables the Raft §9.6 Pre-Vote protocol (defaults to false / enabled)
+	MaxMemoryBytes    int64         // Maximum in-memory footprint for KV store (0 = unlimited)
+	EvictionPolicy    string        // Eviction policy: "reject" (default) or "lru"
 }
 
 // RaftServer coordinates I/O (disk persistence and network transport)
@@ -137,6 +139,9 @@ func NewRaftServer(cfg ServerConfig) (*RaftServer, error) {
 	kv := cfg.KVStore
 	if kv == nil {
 		kv = state.NewKVStore()
+	}
+	if cfg.MaxMemoryBytes > 0 || cfg.EvictionPolicy != "" {
+		kv.SetMemoryLimit(cfg.MaxMemoryBytes, state.EvictionPolicy(cfg.EvictionPolicy))
 	}
 
 	// Restore snapshot if available in storage
@@ -1061,6 +1066,14 @@ func (s *RaftServer) KV() *state.KVStore {
 	return s.kv
 }
 
+// MemoryStats returns the tracked memory footprint, max capacity, and eviction policy of the KV store.
+func (s *RaftServer) MemoryStats() (int64, int64, state.EvictionPolicy) {
+	if s.kv == nil {
+		return 0, 0, state.EvictionPolicyReject
+	}
+	return s.kv.MemoryStats()
+}
+
 // Role returns current node role.
 func (s *RaftServer) Role() state.Role {
 	return s.node.Role()
@@ -1197,6 +1210,9 @@ func (s *RaftServer) ExecuteOrForwardPut(key, value string, expectedVersion *uin
 	if reply.Error != "" {
 		if reply.Error == state.ErrVersionMismatch.Error() {
 			return state.Item{}, state.ErrVersionMismatch
+		}
+		if reply.Error == state.ErrMemoryLimitExceeded.Error() {
+			return state.Item{}, state.ErrMemoryLimitExceeded
 		}
 		return state.Item{}, errors.New(reply.Error)
 	}

@@ -35,6 +35,10 @@ var (
 	// ErrMaxRetriesExceeded indicates that an optimistic concurrency control (OCC) Update
 	// loop reached its maximum retry attempts due to continuous concurrent conflicts.
 	ErrMaxRetriesExceeded = errors.New("kairo: max OCC retries exceeded")
+
+	// ErrMemoryLimitExceeded indicates that a write mutation was rejected because
+	// the cluster reached its configured memory capacity limit (HTTP 507 Insufficient Storage).
+	ErrMemoryLimitExceeded = errors.New("kairo: memory limit exceeded: quota exhausted")
 )
 
 // KeyValue represents a versioned key-value record stored in Kairo.

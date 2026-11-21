@@ -358,6 +358,7 @@ cfg := client.Config{
 | `client.ErrNoLeader` | Cluster is currently in the middle of a leader election | Wait briefly or configure `RetryAttempts` (automatically retried). |
 | `client.ErrNoHealthyEndpoints`| All configured endpoints are unreachable or cooled down | Verify cluster network reachability or fire an alert. |
 | `client.ErrMaxRetriesExceeded`| OCC `Update` exceeded maximum retry iterations due to high write contention | Increase `WithMaxRetries` or introduce jittered sleep. |
+| `client.ErrMemoryLimitExceeded`| Cluster memory limit reached (`HTTP 507 Insufficient Storage`) | Delete obsolete keys, configure higher `-max-memory`, or switch policy to `lru`. |
 | `client.ErrSlowConsumer` | Watch consumer goroutine fell behind channel buffer | Drain watch channel faster or offload processing to worker pool. |
 | `client.ErrClientClosed` | Operation invoked on an already closed `*client.Client` | Do not call methods after `cli.Close()`. |
 
