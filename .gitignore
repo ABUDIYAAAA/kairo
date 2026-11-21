@@ -10,3 +10,4 @@ data/
 
 # Temporary files
 *.tmp
+.agents/

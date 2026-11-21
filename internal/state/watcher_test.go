@@ -217,3 +217,122 @@ func TestWatcherHubConcurrentStress(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestWatcherHubSlowConsumerEviction(t *testing.T) {
+	hub := NewWatcherHub(100)
+	defer hub.Close()
+
+	w, _, err := hub.Watch("slow/key", false, 0)
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+
+	// Fill the watcher channel buffer completely (DefaultWatcherChanCap = 2048)
+	for i := 0; i < DefaultWatcherChanCap; i++ {
+		hub.Publish(WatchEvent{
+			Type:        EventPut,
+			Key:         "slow/key",
+			ModRevision: uint64(i + 1),
+		})
+	}
+
+	// Publish one more event to trigger buffer overflow eviction
+	hub.Publish(WatchEvent{
+		Type:        EventPut,
+		Key:         "slow/key",
+		ModRevision: uint64(DefaultWatcherChanCap + 1),
+	})
+
+	// Watcher should have been evicted and closed
+	if err := w.Err(); !errors.Is(err, ErrSlowWatcher) {
+		t.Fatalf("expected ErrSlowWatcher, got %v", err)
+	}
+
+	// Hub should no longer track this watcher
+	hub.mu.RLock()
+	_, stillExists := hub.allWatchers[w.ID]
+	hub.mu.RUnlock()
+	if stillExists {
+		t.Fatalf("slow watcher was not removed from hub registries")
+	}
+}
+
+func TestWatcherHubCompactedEmptyHistoryOnRestart(t *testing.T) {
+	hub := NewWatcherHub(100)
+	defer hub.Close()
+
+	// Simulate node restart: current revision is 500, but in-memory history buffer is empty
+	hub.SetCurrentRevision(500)
+
+	// Asking for sinceRev = 200 (< 500) must return ErrCompacted, not silent empty replay
+	_, _, err := hub.Watch("mykey", false, 200)
+	if !errors.Is(err, ErrCompacted) {
+		t.Fatalf("expected ErrCompacted for empty history on restart, got %v", err)
+	}
+
+	// Asking for sinceRev = 500 (current revision) should succeed with 0 replayed events
+	w, replayed, err := hub.Watch("mykey", false, 500)
+	if err != nil {
+		t.Fatalf("unexpected error for sinceRev=500: %v", err)
+	}
+	defer w.Close()
+	if len(replayed) != 0 {
+		t.Fatalf("expected 0 replayed events, got %d", len(replayed))
+	}
+}
+
+func TestWatcherHubResetOnSnapshot(t *testing.T) {
+	hub := NewWatcherHub(100)
+	defer hub.Close()
+
+	w, _, err := hub.Watch("snap/key", false, 0)
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+
+	// Reset hub (simulating follower InstallSnapshot restore at revision 1000)
+	hub.Reset(1000)
+
+	// Watcher must be closed and evicted with ErrCompacted
+	if err := w.Err(); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("expected watcher ErrCompacted after Reset, got %v", err)
+	}
+
+	hub.mu.RLock()
+	count := len(hub.allWatchers)
+	hub.mu.RUnlock()
+	if count != 0 {
+		t.Fatalf("expected 0 active watchers after Reset, got %d", count)
+	}
+}
+
+func TestWatcherHubMaxWatchersLimit(t *testing.T) {
+	hub := NewWatcherHub(100)
+	defer hub.Close()
+
+	hub.SetMaxWatchers(3)
+
+	w1, _, err := hub.Watch("k1", false, 0)
+	if err != nil {
+		t.Fatalf("watch 1 failed: %v", err)
+	}
+	defer w1.Close()
+
+	w2, _, err := hub.Watch("k2", false, 0)
+	if err != nil {
+		t.Fatalf("watch 2 failed: %v", err)
+	}
+	defer w2.Close()
+
+	w3, _, err := hub.Watch("k3", false, 0)
+	if err != nil {
+		t.Fatalf("watch 3 failed: %v", err)
+	}
+	defer w3.Close()
+
+	// 4th watcher should exceed capacity
+	_, _, err = hub.Watch("k4", false, 0)
+	if !errors.Is(err, ErrMaxWatchersLimit) {
+		t.Fatalf("expected ErrMaxWatchersLimit, got %v", err)
+	}
+}

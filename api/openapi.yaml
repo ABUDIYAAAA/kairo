@@ -1,0 +1,874 @@
+openapi: 3.1.0
+info:
+  title: Kairo Distributed Key-Value Cluster API
+  version: 1.0.0
+  description: |
+    Production-grade HTTP and Server-Sent Events (SSE) API for the **Kairo** distributed,
+    linearizable key-value storage engine powered by the Raft consensus protocol.
+
+    ### Key Capabilities
+    - **Strict Linearizability**: Raft §8 ReadIndex protocol guarantees linearizable reads across node failovers.
+    - **Ultra-low Latency Stale Reads**: Optional local in-memory reads bypass consensus for sub-millisecond reads.
+    - **Distributed Optimistic Concurrency Control (OCC)**: Server-enforced atomic `CompareAndSwap` (CAS).
+    - **Real-Time Streaming Watches**: Server-Sent Events (`text/event-stream`) with automatic resume and historical replay.
+    - **Dynamic Cluster Membership**: Online learner onboarding, voter promotion, and node eviction.
+  contact:
+    name: Kairo Team
+    url: https://github.com/ABUDIYAAAA/kairo
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: http://127.0.0.1:9001
+    description: Node 1 Client Endpoint
+  - url: http://127.0.0.1:9002
+    description: Node 2 Client Endpoint
+  - url: http://127.0.0.1:9003
+    description: Node 3 Client Endpoint
+  - url: http://127.0.0.1:8999
+    description: Kairo Smart Proxy Endpoint
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: |
+        HTTP Basic Authentication enforced on all operational endpoints.
+        Credentials persist across reboots in `data/auth.json`. Default: `kairo:kairo-secret`.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid HTTP Basic Authentication credentials
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: 'Basic realm="kairo"'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  headers:
+    X-Kairo-Leader-Id:
+      description: Node ID of the currently acknowledged Raft leader.
+      schema:
+        type: integer
+        example: 1
+    X-Kairo-Term:
+      description: Current monotonic Raft election term.
+      schema:
+        type: integer
+        example: 4
+    X-Kairo-Conf-Rev:
+      description: Monotonic configuration revision counter for cluster topology.
+      schema:
+        type: integer
+        example: 3
+    X-Kairo-Active-Peers:
+      description: Comma-separated list of active peer IDs currently reachable by the leader.
+      schema:
+        type: string
+        example: "1,2,3"
+
+  schemas:
+    Item:
+      type: object
+      required:
+        - key
+        - value
+        - version
+        - mod_revision
+      properties:
+        key:
+          type: string
+          example: "configs/cluster-name"
+        value:
+          type: string
+          example: "us-east-prod"
+        version:
+          type: integer
+          description: Per-key mutation counter. Increments monotonically on every mutation of this specific key.
+          example: 1
+        mod_revision:
+          type: integer
+          description: Global monotonic cluster revision at the time of modification.
+          example: 42
+
+    PutRequest:
+      type: object
+      required:
+        - key
+        - value
+      properties:
+        key:
+          type: string
+          description: Unique key identifier.
+          example: "configs/cluster-name"
+        value:
+          type: string
+          description: Data payload.
+          example: "us-east-prod"
+        expected_version:
+          type: integer
+          description: |
+            Optional expected version for atomic Compare-And-Swap (CAS):
+            - `0`: Create key only if it does not already exist.
+            - `> 0`: Mutate key only if current version matches `expected_version`.
+            - `null` / omitted: Unconditional Put (upsert).
+          example: 0
+
+    PutResponse:
+      type: object
+      required:
+        - status
+        - key
+        - value
+        - version
+        - mod_revision
+      properties:
+        status:
+          type: string
+          example: "ok"
+        key:
+          type: string
+          example: "configs/cluster-name"
+        value:
+          type: string
+          example: "us-east-prod"
+        version:
+          type: integer
+          example: 2
+        mod_revision:
+          type: integer
+          example: 43
+
+    DeleteRequest:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+          example: "configs/cluster-name"
+
+    DeleteResponse:
+      type: object
+      required:
+        - status
+        - key
+        - value
+        - version
+        - mod_revision
+      properties:
+        status:
+          type: string
+          example: "deleted"
+        key:
+          type: string
+          example: "configs/cluster-name"
+        value:
+          type: string
+          example: "us-east-prod"
+        version:
+          type: integer
+          example: 3
+        mod_revision:
+          type: integer
+          example: 44
+
+    WatchEvent:
+      type: object
+      required:
+        - type
+        - key
+        - version
+        - mod_revision
+      properties:
+        type:
+          type: string
+          enum: [PUT, DELETE, PROGRESS, SYNC, ERROR]
+          example: "PUT"
+        key:
+          type: string
+          example: "configs/cluster-name"
+        value:
+          type: string
+          example: "us-east-prod"
+        prev_value:
+          type: string
+          example: "us-east-staging"
+        version:
+          type: integer
+          example: 2
+        mod_revision:
+          type: integer
+          example: 43
+
+    ClusterEvent:
+      type: object
+      required:
+        - type
+        - term
+        - conf_rev
+      properties:
+        type:
+          type: string
+          enum: [init, leader_change, peer_state, conf_change]
+          example: "leader_change"
+        leader_id:
+          type: integer
+          example: 1
+        term:
+          type: integer
+          example: 4
+        conf_rev:
+          type: integer
+          example: 3
+        peers:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            "1": "127.0.0.1:8001"
+            "2": "127.0.0.1:8002"
+            "3": "127.0.0.1:8003"
+
+    StatusResponse:
+      type: object
+      required:
+        - node_id
+        - role
+        - term
+        - leader_id
+        - conf_rev
+        - peer_health
+      properties:
+        node_id:
+          type: integer
+          example: 1
+        role:
+          type: string
+          enum: [Follower, Candidate, Leader, Learner]
+          example: "Leader"
+        term:
+          type: integer
+          example: 4
+        leader_id:
+          type: integer
+          example: 1
+        conf_rev:
+          type: integer
+          example: 3
+        peer_health:
+          type: object
+          additionalProperties:
+            type: boolean
+          example:
+            "2": true
+            "3": true
+
+    MembersResponse:
+      type: object
+      required:
+        - leader_id
+        - term
+        - conf_rev
+        - voters
+        - learners
+        - peers
+        - peer_health
+      properties:
+        leader_id:
+          type: integer
+          example: 1
+        term:
+          type: integer
+          example: 4
+        conf_rev:
+          type: integer
+          example: 3
+        voters:
+          type: array
+          items:
+            type: integer
+          example: [1, 2, 3]
+        learners:
+          type: array
+          items:
+            type: integer
+          example: []
+        peers:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            "1": "127.0.0.1:8001"
+            "2": "127.0.0.1:8002"
+            "3": "127.0.0.1:8003"
+        peer_health:
+          type: object
+          additionalProperties:
+            type: boolean
+          example:
+            "2": true
+            "3": true
+
+    MemberAddRequest:
+      type: object
+      required:
+        - id
+        - addr
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          description: Unique positive node ID.
+          example: 4
+        addr:
+          type: string
+          description: Internal Raft transport address (host:port).
+          example: "127.0.0.1:8004"
+
+    MemberIDRequest:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          example: 4
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          example: "key not found"
+
+security:
+  - basicAuth: []
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      description: Returns HTTP 200 if the node HTTP server process is running. Bypasses authentication.
+      security: []
+      responses:
+        '200':
+          description: Node is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+        '500':
+          description: Node process unresponsive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /livez:
+    get:
+      operationId: getLivez
+      summary: Kubernetes liveness probe
+      description: Alias of `/healthz`. Bypasses authentication.
+      security: []
+      responses:
+        '200':
+          description: Node is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+        '500':
+          description: Node process unresponsive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /status:
+    get:
+      operationId: getStatus
+      summary: Node and cluster status
+      description: Returns the current Raft role, term, leader ID, topology revision, and peer heartbeat health.
+      responses:
+        '200':
+          description: Operational node status
+          headers:
+            X-Kairo-Leader-Id:
+              $ref: '#/components/headers/X-Kairo-Leader-Id'
+            X-Kairo-Term:
+              $ref: '#/components/headers/X-Kairo-Term'
+            X-Kairo-Conf-Rev:
+              $ref: '#/components/headers/X-Kairo-Conf-Rev'
+            X-Kairo-Active-Peers:
+              $ref: '#/components/headers/X-Kairo-Active-Peers'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /get:
+    get:
+      operationId: getKey
+      summary: Retrieve key-value pair
+      description: |
+        Retrieves the value, per-key version, and cluster modification revision for a key.
+        - **Linearizable read (default)**: Quorum confirmed via Raft §8 ReadIndex.
+        - **Stale read (`stale=true` or `consistent=false`)**: Read directly from local in-memory state machine.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Target key to retrieve.
+          example: "configs/cluster-name"
+        - name: stale
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: When `true`, serves sub-millisecond read directly from local memory without Raft round-trip.
+        - name: consistent
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: When `false`, acts as alias for `stale=true`.
+      responses:
+        '200':
+          description: Key found and retrieved successfully
+          headers:
+            X-Kairo-Leader-Id:
+              $ref: '#/components/headers/X-Kairo-Leader-Id'
+            X-Kairo-Term:
+              $ref: '#/components/headers/X-Kairo-Term'
+            X-Kairo-Conf-Rev:
+              $ref: '#/components/headers/X-Kairo-Conf-Rev'
+            X-Kairo-Active-Peers:
+              $ref: '#/components/headers/X-Kairo-Active-Peers'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '400':
+          description: Missing key query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Key does not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Cluster has no elected leader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /put:
+    post:
+      operationId: putKey
+      summary: Upsert key or atomic Compare-And-Swap (CAS)
+      description: |
+        Applies a write to the distributed state machine via Raft consensus.
+        If `expected_version` is supplied:
+        - `0`: Succeeds only if key does not exist (Create If Not Present).
+        - `> 0`: Succeeds only if current version equals `expected_version`.
+        Returns HTTP 409 Conflict if current version does not match.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutRequest'
+      responses:
+        '200':
+          description: Mutation committed to Raft quorum
+          headers:
+            X-Kairo-Leader-Id:
+              $ref: '#/components/headers/X-Kairo-Leader-Id'
+            X-Kairo-Term:
+              $ref: '#/components/headers/X-Kairo-Term'
+            X-Kairo-Conf-Rev:
+              $ref: '#/components/headers/X-Kairo-Conf-Rev'
+            X-Kairo-Active-Peers:
+              $ref: '#/components/headers/X-Kairo-Active-Peers'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutResponse'
+        '400':
+          description: Invalid JSON or empty key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Version mismatch (CAS conflict)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Cluster has no elected leader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /delete:
+    post:
+      operationId: deleteKey
+      summary: Delete key
+      description: Removes a key from the state machine via Raft consensus. Returns the deleted record metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteRequest'
+      responses:
+        '200':
+          description: Key deleted successfully
+          headers:
+            X-Kairo-Leader-Id:
+              $ref: '#/components/headers/X-Kairo-Leader-Id'
+            X-Kairo-Term:
+              $ref: '#/components/headers/X-Kairo-Term'
+            X-Kairo-Conf-Rev:
+              $ref: '#/components/headers/X-Kairo-Conf-Rev'
+            X-Kairo-Active-Peers:
+              $ref: '#/components/headers/X-Kairo-Active-Peers'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+        '400':
+          description: Invalid JSON or empty key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Cluster has no elected leader
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /watch:
+    get:
+      operationId: watchKeys
+      summary: Real-time key modification watch stream (SSE)
+      description: |
+        Subscribes to mutation events (PUT, DELETE) for a key or prefix via Server-Sent Events (SSE).
+        - **Historical Replay**: Specify `since_rev` to replay missed events from past Raft commits.
+        - **Single Event Mode**: Set `stream=false` to return the first matching event as regular JSON.
+        - **Prefix Watching**: Set `prefix=true` to match all keys beginning with the query string.
+      parameters:
+        - name: key
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "configs/"
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: since_rev
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Replay mutations occurring strictly after this global revision.
+          example: 10
+        - name: stream
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: true
+          description: If `false`, delivers a single JSON event and terminates connection.
+      responses:
+        '200':
+          description: Continuous Server-Sent Events (SSE) stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/WatchEvent'
+        '400':
+          description: Missing key parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '410':
+          description: Requested revision has been compacted and pruned from memory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /cluster/events:
+    get:
+      operationId: clusterEvents
+      summary: Cluster topology and membership event stream (SSE)
+      description: |
+        Real-time SSE stream of cluster state changes (leader elections, node heartbeats, membership updates).
+        Immediately yields an initial `init` event containing the current cluster snapshot upon connection.
+      responses:
+        '200':
+          description: Continuous Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/ClusterEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /snapshot:
+    post:
+      operationId: createSnapshot
+      summary: Trigger manual snapshot and log compaction
+      description: Persists the state machine to disk and compacts preceding Raft log entries.
+      responses:
+        '200':
+          description: Snapshot completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          description: Snapshot execution failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /members:
+    get:
+      operationId: listMembers
+      summary: Cluster membership list
+      description: Returns current active leader, voters, learners, and peer network endpoints.
+      responses:
+        '200':
+          description: Cluster membership status
+          headers:
+            X-Kairo-Leader-Id:
+              $ref: '#/components/headers/X-Kairo-Leader-Id'
+            X-Kairo-Term:
+              $ref: '#/components/headers/X-Kairo-Term'
+            X-Kairo-Conf-Rev:
+              $ref: '#/components/headers/X-Kairo-Conf-Rev'
+            X-Kairo-Active-Peers:
+              $ref: '#/components/headers/X-Kairo-Active-Peers'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MembersResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /member/add:
+    post:
+      operationId: addMember
+      summary: Add learner node to cluster
+      description: Adds a non-voting learner node to catch up on log replication prior to voter promotion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberAddRequest'
+      responses:
+        '200':
+          description: Learner node successfully added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "learner_added"
+                  node_id:
+                    type: integer
+                    example: 4
+        '400':
+          description: Invalid node ID or address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Another membership change is pending commit or node already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /member/promote:
+    post:
+      operationId: promoteMember
+      summary: Promote learner to voting member
+      description: Promotes a fully caught-up learner node to a voting Raft quorum member.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberIDRequest'
+      responses:
+        '200':
+          description: Node promoted to voter
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "promoted"
+                  node_id:
+                    type: integer
+                    example: 4
+        '400':
+          description: Learner is not caught up with leader log yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Learner node not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /member/remove:
+    post:
+      operationId: removeMember
+      summary: Remove node from cluster
+      description: Demotes and removes a node from the cluster quorum.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberIDRequest'
+      responses:
+        '200':
+          description: Node removed from cluster
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "removed"
+                  node_id:
+                    type: integer
+                    example: 4
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Node not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /docs:
+    get:
+      operationId: getApiDocs
+      summary: Interactive API documentation (Scalar)
+      description: Serves interactive API reference UI rendered with Scalar. Bypasses authentication.
+      security: []
+      responses:
+        '200':
+          description: HTML API Reference documentation
+          content:
+            text/html:
+              schema:
+                type: string
+        '404':
+          description: Documentation page not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /openapi.yaml:
+    get:
+      operationId: getOpenApiSpec
+      summary: Raw OpenAPI 3.1 specification
+      description: Serves this raw OpenAPI specification in YAML format. Bypasses authentication.
+      security: []
+      responses:
+        '200':
+          description: OpenAPI 3.1 YAML document
+          content:
+            text/yaml:
+              schema:
+                type: string
+        '404':
+          description: Specification not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'

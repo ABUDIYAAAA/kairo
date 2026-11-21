@@ -93,6 +93,9 @@ func (c *Client) runWatchStream(
 		if opts.Prefix {
 			params.Set("prefix", "true")
 		}
+		if opts.ProgressNotify {
+			params.Set("progress", "true")
+		}
 		if lastSeenRev > 0 {
 			params.Set("since_rev", fmt.Sprintf("%d", lastSeenRev))
 		}
@@ -143,12 +146,39 @@ func (c *Client) runWatchStream(
 		if resp.StatusCode == http.StatusGone {
 			// Revision was compacted away
 			_ = resp.Body.Close()
+			if opts.AutoResync {
+				if err := c.resyncWatch(streamCtx, key, opts, ch, &lastSeenRev); err != nil {
+					select {
+					case ch <- WatchResponse{Err: fmt.Errorf("kairo: auto-resync failed: %w", err)}:
+					case <-streamCtx.Done():
+					case <-c.closeCh:
+					}
+					return
+				}
+				continue
+			}
 			select {
 			case ch <- WatchResponse{Err: ErrCompacted}:
 			case <-streamCtx.Done():
 			case <-c.closeCh:
 			}
 			return
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			c.pool.MarkFailed(idx)
+			_ = resp.Body.Close()
+			timer := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-streamCtx.Done():
+				timer.Stop()
+				return
+			case <-c.closeCh:
+				timer.Stop()
+				return
+			}
+			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -171,10 +201,25 @@ func (c *Client) runWatchStream(
 		c.pool.MarkSuccess(idx)
 
 		// Read SSE stream
-		streamErr := c.consumeSSE(streamCtx, resp.Body, &lastSeenRev, ch)
+		streamErr := c.consumeSSE(streamCtx, resp.Body, &lastSeenRev, opts, ch)
 		_ = resp.Body.Close()
 
 		if streamErr == nil || errors.Is(streamErr, context.Canceled) {
+			return
+		}
+
+		if errors.Is(streamErr, ErrSlowConsumer) {
+			if opts.AutoResync {
+				if err := c.resyncWatch(streamCtx, key, opts, ch, &lastSeenRev); err != nil {
+					select {
+					case ch <- WatchResponse{Err: fmt.Errorf("kairo: auto-resync failed: %w", err)}:
+					case <-streamCtx.Done():
+					case <-c.closeCh:
+					}
+					return
+				}
+				continue
+			}
 			return
 		}
 
@@ -196,6 +241,7 @@ func (c *Client) consumeSSE(
 	ctx context.Context,
 	body io.Reader,
 	lastSeenRev *uint64,
+	opts WatchOptions,
 	ch chan<- WatchResponse,
 ) error {
 	reader := bufio.NewReader(body)
@@ -241,8 +287,28 @@ func (c *Client) consumeSSE(
 				continue
 			}
 
-			if ev.ModRevision > *lastSeenRev {
-				*lastSeenRev = ev.ModRevision
+			if ev.Type == WatchProgress {
+				if ev.ModRevision > *lastSeenRev {
+					*lastSeenRev = ev.ModRevision
+				}
+				if !opts.ProgressNotify {
+					continue
+				}
+			} else if ev.Type == WatchError {
+				if !opts.AutoResync {
+					select {
+					case ch <- WatchResponse{Err: ErrSlowConsumer}:
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-c.closeCh:
+						return ErrClientClosed
+					}
+				}
+				return ErrSlowConsumer
+			} else {
+				if ev.ModRevision > *lastSeenRev {
+					*lastSeenRev = ev.ModRevision
+				}
 			}
 
 			select {
@@ -254,4 +320,65 @@ func (c *Client) consumeSSE(
 			}
 		}
 	}
+}
+
+func (c *Client) resyncWatch(
+	ctx context.Context,
+	key string,
+	opts WatchOptions,
+	ch chan<- WatchResponse,
+	lastSeenRev *uint64,
+) error {
+	if opts.Prefix {
+		kvs, err := c.PrefixScan(ctx, key)
+		if err != nil {
+			return err
+		}
+		for _, kv := range kvs {
+			if kv.ModRevision > *lastSeenRev {
+				*lastSeenRev = kv.ModRevision
+			}
+			ev := WatchEvent{
+				Type:        WatchSync,
+				Key:         kv.Key,
+				Value:       kv.Value,
+				Version:     kv.Version,
+				ModRevision: kv.ModRevision,
+			}
+			select {
+			case ch <- WatchResponse{Event: ev}:
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.closeCh:
+				return ErrClientClosed
+			}
+		}
+		return nil
+	}
+
+	kv, err := c.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			return nil
+		}
+		return err
+	}
+	if kv.ModRevision > *lastSeenRev {
+		*lastSeenRev = kv.ModRevision
+	}
+	ev := WatchEvent{
+		Type:        WatchSync,
+		Key:         kv.Key,
+		Value:       kv.Value,
+		Version:     kv.Version,
+		ModRevision: kv.ModRevision,
+	}
+	select {
+	case ch <- WatchResponse{Event: ev}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closeCh:
+		return ErrClientClosed
+	}
+	return nil
 }

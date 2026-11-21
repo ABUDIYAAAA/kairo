@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
+	apispec "github.com/ABUDIYAAAA/kairo/api"
 	"github.com/ABUDIYAAAA/kairo/internal/auth"
 	"github.com/ABUDIYAAAA/kairo/internal/raft"
 	"github.com/ABUDIYAAAA/kairo/internal/state"
@@ -26,6 +28,32 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		_, _ = w.Write(apispec.OpenAPISpec)
+	})
+
+	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		const scalarHTML = `<!doctype html>
+<html>
+  <head>
+    <title>Kairo Cluster API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+    <style>
+      body { margin: 0; padding: 0; }
+    </style>
+  </head>
+  <body>
+    <script id="api-reference" data-url="/openapi.yaml"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>`
+		_, _ = w.Write([]byte(scalarHTML))
 	})
 
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +120,25 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 		key := r.URL.Query().Get("key")
 		if key == "" {
 			http.Error(w, `{"error":"key required"}`, http.StatusBadRequest)
+			return
+		}
+
+		if r.URL.Query().Get("prefix") == "true" {
+			items := rs.ScanPrefix(key)
+			var kvs []map[string]any
+			for k, item := range items {
+				kvs = append(kvs, map[string]any{
+					"key":          k,
+					"value":        item.Value,
+					"version":      item.Version,
+					"mod_revision": item.ModRevision,
+				})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"kvs":          kvs,
+				"mod_revision": rs.Revision(),
+			})
 			return
 		}
 
@@ -212,6 +259,7 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 
 		prefix := r.URL.Query().Get("prefix") == "true"
 		stream := r.URL.Query().Get("stream") != "false"
+		progress := r.URL.Query().Get("progress") == "true"
 
 		var sinceRev uint64
 		if sRevStr := r.URL.Query().Get("since_rev"); sRevStr != "" {
@@ -224,6 +272,8 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 		if err != nil {
 			if errors.Is(err, state.ErrCompacted) {
 				http.Error(w, `{"error":"requested revision has been compacted"}`, http.StatusGone)
+			} else if errors.Is(err, state.ErrMaxWatchersLimit) {
+				http.Error(w, `{"error":"maximum active watchers limit reached"}`, http.StatusTooManyRequests)
 			} else {
 				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 			}
@@ -265,17 +315,41 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 			flusher.Flush()
 		}
 
+		keepAliveTicker := time.NewTicker(15 * time.Second)
+		defer keepAliveTicker.Stop()
+
 		for {
 			select {
 			case <-r.Context().Done():
 				return
+			case <-keepAliveTicker.C:
+				if progress {
+					progEv := state.WatchEvent{
+						Type:        state.EventProgress,
+						ModRevision: rs.Revision(),
+					}
+					data, _ := json.Marshal(progEv)
+					if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", progEv.Type, data); err != nil {
+						return
+					}
+				} else {
+					if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+						return
+					}
+				}
+				flusher.Flush()
 			case ev, ok := <-eventsCh:
 				if !ok {
 					return
 				}
 				data, _ := json.Marshal(ev)
-				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+				if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data); err != nil {
+					return
+				}
 				flusher.Flush()
+				if ev.Type == state.EventError {
+					return
+				}
 			}
 		}
 	})
@@ -416,11 +490,13 @@ func NewHandler(rs *raft.RaftServer, authMgr ...*auth.Manager) http.Handler {
 	}
 
 	metadataMiddleware := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Kairo-Leader-Id", strconv.Itoa(rs.Leader()))
-		w.Header().Set("X-Kairo-Term", strconv.FormatUint(rs.Term(), 10))
-		w.Header().Set("X-Kairo-Conf-Rev", strconv.FormatUint(rs.ConfRev(), 10))
-		if rs.Role() == state.Leader {
-			w.Header().Set("X-Kairo-Active-Peers", rs.ActivePeersHeader())
+		if rs != nil {
+			w.Header().Set("X-Kairo-Leader-Id", strconv.Itoa(rs.Leader()))
+			w.Header().Set("X-Kairo-Term", strconv.FormatUint(rs.Term(), 10))
+			w.Header().Set("X-Kairo-Conf-Rev", strconv.FormatUint(rs.ConfRev(), 10))
+			if rs.Role() == state.Leader {
+				w.Header().Set("X-Kairo-Active-Peers", rs.ActivePeersHeader())
+			}
 		}
 		mux.ServeHTTP(w, r)
 	})

@@ -772,3 +772,88 @@ func TestKairoConnectionStringParsing(t *testing.T) {
 		})
 	}
 }
+
+func TestClientWatchAutoResyncOnCompacted(t *testing.T) {
+	var watchConnCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/get" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(KeyValue{
+				Key:         "resync-key",
+				Value:       "synced-baseline",
+				Version:     1,
+				ModRevision: 50,
+			})
+			return
+		}
+
+		if r.URL.Path == "/watch" {
+			count := atomic.AddInt32(&watchConnCount, 1)
+			if count == 1 {
+				// Simulate revision compacted on first connect
+				http.Error(w, `{"error":"requested revision has been compacted"}`, http.StatusGone)
+				return
+			}
+
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher.Flush()
+
+			// Emit subsequent live event
+			ev := WatchEvent{
+				Type:        WatchPut,
+				Key:         "resync-key",
+				Value:       "live-val",
+				Version:     2,
+				ModRevision: 51,
+			}
+			data, _ := json.Marshal(ev)
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, data)
+			flusher.Flush()
+
+			<-r.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	cli, err := New(Config{Endpoints: []string{server.URL}})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer cli.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watchCh := cli.Watch(ctx, "resync-key", WithAutoResync(true), WithSinceRevision(10))
+
+	// 1. Should receive WatchSync baseline from auto-resync
+	select {
+	case resp := <-watchCh:
+		if resp.Err != nil {
+			t.Fatalf("unexpected resync error: %v", resp.Err)
+		}
+		if resp.Event.Type != WatchSync || resp.Event.Value != "synced-baseline" || resp.Event.ModRevision != 50 {
+			t.Fatalf("unexpected sync event: %+v", resp.Event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for auto-resync event")
+	}
+
+	// 2. Should receive live event after watch was automatically re-established
+	select {
+	case resp := <-watchCh:
+		if resp.Err != nil {
+			t.Fatalf("unexpected live error: %v", resp.Err)
+		}
+		if resp.Event.Type != WatchPut || resp.Event.Value != "live-val" || resp.Event.ModRevision != 51 {
+			t.Fatalf("unexpected live event: %+v", resp.Event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for live event")
+	}
+}

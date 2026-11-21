@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,6 +31,9 @@ func TestContainerClusterLifecycleAndLinearizability(t *testing.T) {
 		StartTimeout: 30 * time.Second,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "Cannot connect to the Docker daemon") || strings.Contains(err.Error(), "failed to create Docker provider") {
+			t.Skipf("skipping testcontainers test: docker daemon not running: %v", err)
+		}
 		t.Fatalf("failed to create testcontainers cluster: %v", err)
 	}
 	defer func() {
@@ -204,6 +208,9 @@ func TestContainerChaosBenchmark(t *testing.T) {
 		StartTimeout: 30 * time.Second,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "Cannot connect to the Docker daemon") || strings.Contains(err.Error(), "failed to create Docker provider") {
+			t.Skipf("skipping container chaos benchmark: docker daemon not running: %v", err)
+		}
 		t.Fatalf("failed to boot container cluster: %v", err)
 	}
 	defer func() {

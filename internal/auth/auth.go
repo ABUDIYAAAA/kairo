@@ -153,8 +153,8 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// Health checks bypass authentication for container orchestrators
-		if path == "/healthz" || path == "/livez" || path == "/proxy/healthz" {
+		// Health checks and public documentation bypass authentication
+		if path == "/healthz" || path == "/livez" || path == "/proxy/healthz" || path == "/docs" || path == "/openapi.yaml" {
 			next.ServeHTTP(w, r)
 			return
 		}

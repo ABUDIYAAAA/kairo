@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -91,6 +92,9 @@ func (s *KVStore) SetWatcherHub(hub *WatcherHub) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hub = hub
+	if hub != nil && s.revision > 0 {
+		hub.SetCurrentRevision(s.revision)
+	}
 }
 
 // WatcherHub returns the active WatcherHub attached to the state machine.
@@ -110,6 +114,20 @@ func (s *KVStore) Get(key string) (Item, error) {
 		return Item{}, ErrKeyNotFound
 	}
 	return item, nil
+}
+
+// ScanPrefix returns all items whose key starts with the specified prefix.
+func (s *KVStore) ScanPrefix(prefix string) map[string]Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	results := make(map[string]Item)
+	for k, item := range s.data {
+		if strings.HasPrefix(k, prefix) {
+			results[k] = item
+		}
+	}
+	return results
 }
 
 // Put updates or creates a key-value pair, incrementing its per-key version
@@ -329,6 +347,10 @@ func (s *KVStore) Restore(data []byte) error {
 	s.clientSessions = snap.ClientSessions
 	if s.clientSessions == nil {
 		s.clientSessions = make(map[string]ClientResult)
+	}
+
+	if s.hub != nil {
+		s.hub.Reset(s.revision)
 	}
 
 	return nil

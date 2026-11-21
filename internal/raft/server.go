@@ -954,6 +954,14 @@ func (s *RaftServer) Get(key string) (state.Item, error) {
 	return s.kv.Get(key)
 }
 
+// ScanPrefix reads all items whose keys start with prefix directly from local state machine.
+func (s *RaftServer) ScanPrefix(prefix string) map[string]state.Item {
+	if s.kv == nil {
+		return nil
+	}
+	return s.kv.ScanPrefix(prefix)
+}
+
 // LinearizableGet executes a strictly linearizable read using the Raft §8 ReadIndex protocol.
 // It confirms leadership with a quorum of peers without writing to disk or appending to the log,
 // waits until preceding writes are applied to the state machine, and returns the current value.
@@ -1531,6 +1539,14 @@ func (s *RaftServer) Watch(ctx context.Context, key string, prefix bool, sinceRe
 	}()
 
 	return w.Events, replayed, cancel, nil
+}
+
+// Revision returns the current applied state machine revision.
+func (s *RaftServer) Revision() uint64 {
+	if s.kv == nil {
+		return 0
+	}
+	return s.kv.Revision()
 }
 
 // LatencyMetrics returns average commit latency, max commit latency, total commits,

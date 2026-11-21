@@ -17,6 +17,12 @@ var (
 	// by Raft snapshotting and log compaction (HTTP 410 Gone).
 	ErrCompacted = errors.New("kairo: requested revision has been compacted")
 
+	// ErrSlowConsumer indicates that the client fell behind and was evicted due to channel buffer overflow.
+	ErrSlowConsumer = errors.New("kairo: watcher buffer overflow: slow consumer evicted")
+
+	// ErrMaxWatchersLimit indicates maximum active watcher capacity has been reached on the target node.
+	ErrMaxWatchersLimit = errors.New("kairo: maximum active watchers limit reached")
+
 	// ErrNoLeader indicates that the cluster currently has no elected leader.
 	ErrNoLeader = errors.New("kairo: cluster has no elected leader")
 
@@ -65,6 +71,15 @@ const (
 
 	// WatchDelete indicates a key was removed from the store.
 	WatchDelete WatchEventType = "DELETE"
+
+	// WatchProgress indicates a progress notification advancing the cluster revision.
+	WatchProgress WatchEventType = "PROGRESS"
+
+	// WatchSync indicates a baseline synchronization event during auto-resync.
+	WatchSync WatchEventType = "SYNC"
+
+	// WatchError indicates an unrecoverable watcher error (such as slow consumer buffer overflow).
+	WatchError WatchEventType = "ERROR"
 )
 
 // WatchEvent represents a single real-time mutation notification delivered by a Watch stream.

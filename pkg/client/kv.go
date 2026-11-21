@@ -59,6 +59,35 @@ func (c *Client) Get(ctx context.Context, key string, opts ...GetOption) (*KeyVa
 	}
 }
 
+// PrefixScan retrieves all keys starting with prefix from the cluster.
+func (c *Client) PrefixScan(ctx context.Context, prefix string) ([]KeyValue, error) {
+	if prefix == "" {
+		return nil, errors.New("kairo: prefix cannot be empty")
+	}
+
+	params := url.Values{}
+	params.Set("key", prefix)
+	params.Set("prefix", "true")
+
+	path := "/get?" + params.Encode()
+	body, code, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("kairo: PrefixScan failed with status %d: %s", code, extractErrorMessage(body))
+	}
+
+	var resp struct {
+		KVs []KeyValue `json:"kvs"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("kairo: failed to decode PrefixScan response: %w", err)
+	}
+	return resp.KVs, nil
+}
+
 // Put updates or creates a key-value record unconditionally, returning the resulting KeyValue.
 func (c *Client) Put(ctx context.Context, key, value string) (*KeyValue, error) {
 	return c.putInternal(ctx, key, value, nil)

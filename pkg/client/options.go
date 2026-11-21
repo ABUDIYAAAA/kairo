@@ -176,8 +176,10 @@ func WithOCCBackoff(backoff time.Duration) UpdateOption {
 
 // WatchOptions represents options for real-time Watch streams.
 type WatchOptions struct {
-	Prefix        bool
-	SinceRevision uint64
+	Prefix         bool
+	SinceRevision  uint64
+	ProgressNotify bool
+	AutoResync     bool
 }
 
 // WatchOption defines a functional option for configuring a Watch stream.
@@ -195,5 +197,20 @@ func WithPrefix(prefix bool) WatchOption {
 func WithSinceRevision(rev uint64) WatchOption {
 	return func(o *WatchOptions) {
 		o.SinceRevision = rev
+	}
+}
+
+// WithProgressNotify enables delivery of periodic PROGRESS notifications advancing the known cluster revision.
+func WithProgressNotify(enable bool) WatchOption {
+	return func(o *WatchOptions) {
+		o.ProgressNotify = enable
+	}
+}
+
+// WithAutoResync enables automatic state synchronization via GET and restarts the watch
+// if the stream is evicted due to log compaction (ErrCompacted) or slow consumer buffer overflow.
+func WithAutoResync(enable bool) WatchOption {
+	return func(o *WatchOptions) {
+		o.AutoResync = enable
 	}
 }

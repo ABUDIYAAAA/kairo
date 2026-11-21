@@ -1,4 +1,4 @@
-.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness chaos-harness-containers test-chaos build-proxy run-proxy docker-build docker-up docker-down docker-status docker-logs test-containers
+.PHONY: build run-node1 run-node2 run-node3 start stop status clean test test-sim test-all build-harness chaos-harness chaos-harness-containers test-chaos build-proxy run-proxy docker-build docker-up docker-down docker-status docker-logs test-containers docs docs-lint docs-html docs-md
 
 BUILD_DIR := bin
 BINARY := $(BUILD_DIR)/kairo
@@ -138,3 +138,21 @@ docker-logs:
 # Testcontainers end-to-end integration & chaos suite
 test-containers: docker-build
 	go test -v -count=1 -run "TestContainer" ./tests
+
+# Documentation targets
+docs: docs-lint docs-html docs-md
+	@echo "Documentation generation complete. Artifacts in docs/"
+
+docs-lint:
+	@echo "Validating OpenAPI specification with Redocly..."
+	@npx -y @redocly/cli lint api/openapi.yaml
+
+docs-html:
+	@echo "Building standalone HTML documentation with Redoc..."
+	@mkdir -p docs
+	@npx -y @redocly/cli build-docs api/openapi.yaml -o docs/index.html
+
+docs-md:
+	@echo "Generating Markdown API documentation with Widdershins..."
+	@mkdir -p docs
+	@npx -y widdershins api/openapi.yaml -o docs/API.md --summary
